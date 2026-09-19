@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+lb config noauto \
+    --mode debian \
+    --distribution bookworm \
+    --architectures amd64 \
+    --archive-areas "main contrib non-free non-free-firmware" \
+    --bootloader grub-efi \
+    --binary-images iso-hybrid \
+    --image-name agentic-os-live-amd64 \
+    --memtest none \
+    --source false \
+    "${@}"
