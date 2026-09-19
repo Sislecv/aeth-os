@@ -1,0 +1,13 @@
+# Universal Hardware Drivers & Firmware (WiFi, Bluetooth, GPU Acceleration)
+firmware-atheros
+firmware-iwlwifi
+firmware-libertas
+firmware-linux
+firmware-linux-free
+firmware-linux-nonfree
+firmware-misc-nonfree
+firmware-realtek
+libgl1-mesa-dri
+mesa-va-drivers
+mesa-vulkan-drivers
+xserver-xorg-video-all

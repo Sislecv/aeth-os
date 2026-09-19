@@ -1,0 +1,20 @@
+# Core Base System & Storage / Live Infrastructure
+btrfs-progs
+ca-certificates
+cryptsetup
+curl
+dbus-user-session
+dosfstools
+e2fsprogs
+linux-image-amd64
+live-boot
+live-config
+live-config-systemd
+network-manager
+parted
+pciutils
+sudo
+systemd-sysv
+usbutils
+wget
+zram-tools

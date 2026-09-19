@@ -1,0 +1,14 @@
+# Trimmed GNOME Wayland Desktop Environment & Accessibility
+# Note: libcanberra-gtk3-module is declared in 05-voice.list.chroot to avoid cross-list duplicates
+at-spi2-core
+fonts-firacode
+fonts-inter
+fonts-noto-cjk
+fonts-roboto
+gdm3
+gnome-core
+gnome-shell
+gnome-tweaks
+mutter
+nautilus
+papirus-icon-theme

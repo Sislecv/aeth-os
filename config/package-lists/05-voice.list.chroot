@@ -1,0 +1,10 @@
+# PipeWire Audio Infrastructure, Voice Engine Dependencies & Audio Feedback
+ffmpeg
+libasound2-dev
+libcanberra-gtk3-module
+pipewire
+pipewire-audio-client-libraries
+pipewire-pulse
+sox
+wireplumber
+wtype

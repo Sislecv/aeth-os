@@ -1,0 +1,15 @@
+# Modern Terminal Environment & Developer Toolchain
+bat
+build-essential
+eza
+fd-find
+git
+htop
+jq
+neovim
+procps
+ptyxis
+ripgrep
+tmux
+zellij
+zsh
