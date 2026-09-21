@@ -146,10 +146,13 @@ agentic_send_command() {
 
     _agentic_zellij_forward "$cmd"
 
-    # Clear interactive readline buffer if invoked via keybind
+    # Clear interactive readline or ZLE buffer if invoked via keybind
     if [ -n "${READLINE_LINE:-}" ]; then
         READLINE_LINE=""
         READLINE_POINT=0
+    elif [ -n "${BUFFER:-}" ]; then
+        BUFFER=""
+        CURSOR=0
     fi
 }
 
@@ -159,7 +162,8 @@ agentic_send_logs() {
     local logs=""
 
     if command -v zellij >/dev/null 2>&1 && [ -n "${ZELLIJ:-}" ]; then
-        local tmp_dump="/tmp/agentic-screen-$$.txt"
+        local tmp_dump
+        tmp_dump="$(mktemp /tmp/agentic-screen.XXXXXX 2>/dev/null || echo "/tmp/agentic-screen-$$.txt")"
         zellij action dump-screen "$tmp_dump" 2>/dev/null || true
         if [ -f "$tmp_dump" ]; then
             logs="$(tail -n "$lines" "$tmp_dump" 2>/dev/null || true)"
@@ -231,7 +235,7 @@ if [ -n "${BASH_VERSION:-}" ]; then
         local exit_code=$?
         _AGENTIC_IN_PROMPT=1
         local cmd="${_AGENTIC_LAST_COMMAND:-}"
-        if [ -z "$cmd" ]; then
+        if [ -z "$cmd" ] || [ "$cmd" = "_agentic_bash_prompt_command" ] || [[ "$cmd" == _agentic_* ]]; then
             cmd="$(fc -ln -1 2>/dev/null | sed -e 's/^[[:space:]]*//')"
         fi
         _agentic_on_command_complete "$exit_code" "$cmd"
@@ -241,7 +245,7 @@ if [ -n "${BASH_VERSION:-}" ]; then
     }
 
     _agentic_bash_debug_trap() {
-        if [ "${_AGENTIC_IN_PROMPT:-0}" -eq 0 ]; then
+        if [ "${_AGENTIC_IN_PROMPT:-0}" -eq 0 ] && [ "${BASH_COMMAND:-}" != "_agentic_bash_prompt_command" ] && [[ "${BASH_COMMAND:-}" != _agentic_* ]]; then
             _AGENTIC_LAST_COMMAND="${BASH_COMMAND:-}"
         fi
     }

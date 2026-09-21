@@ -221,6 +221,47 @@ class TestShellHooks(unittest.TestCase):
             self.assertIn("timestamp", payload)
             self.assertIn("cwd", payload)
 
+    def test_bash_debug_trap_does_not_capture_prompt_command(self):
+        """Verify that a failing command in Bash reports the actual command and not _agentic_bash_prompt_command."""
+        with tempfile.TemporaryDirectory() as td:
+            sock_path = os.path.join(td, "test-agentic.sock")
+            received = []
+
+            def srv():
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.bind(sock_path)
+                s.listen(1)
+                conn, _ = s.accept()
+                data = conn.recv(4096)
+                if data:
+                    received.append(json.loads(data.decode("utf-8")))
+                conn.close()
+                s.close()
+
+            t = threading.Thread(target=srv, daemon=True)
+            t.start()
+
+            script = f"""
+            source {SHELL_HOOKS_PATH}
+            failed_custom_command_123 2>/dev/null
+            _agentic_bash_prompt_command
+            """
+            res = subprocess.run(
+                ["bash", "-c", script],
+                env={**os.environ, "AGENTIC_SOCK": sock_path, "AGENTIC_SYNC_SEND": "1"},
+                capture_output=True,
+                text=True
+            )
+            self.assertEqual(res.returncode, 127)
+            t.join(timeout=2)
+
+            self.assertEqual(len(received), 1)
+            payload = received[0]
+            self.assertEqual(payload.get("event"), "command_failed")
+            self.assertNotEqual(payload.get("command"), "_agentic_bash_prompt_command")
+            self.assertIn("failed_custom_command_123", payload.get("command", ""))
+            self.assertEqual(payload.get("exit_code"), 127)
+
     def test_send_command_alt_a_payload(self):
         """Verify Alt+A (agentic_send_command) sends user_command_submit event."""
         with tempfile.TemporaryDirectory() as td:

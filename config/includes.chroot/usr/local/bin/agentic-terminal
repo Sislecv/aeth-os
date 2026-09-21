@@ -86,14 +86,15 @@ resolve_layout_path() {
     local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
     if [ -n "$script_dir" ]; then
-        # Check relative to chroot: ../../etc/zellij/agentic.kdl
-        if [ -f "$script_dir/../../etc/zellij/agentic.kdl" ]; then
-            LAYOUT="$(cd "$script_dir/../../etc/zellij" && pwd)/agentic.kdl"
+        # Check 3 levels up: matches /usr/local/bin -> /etc and
+        # config/includes.chroot/usr/local/bin -> config/includes.chroot/etc
+        if [ -f "$script_dir/../../../etc/zellij/agentic.kdl" ]; then
+            LAYOUT="$(cd "$script_dir/../../../etc/zellij" && pwd)/agentic.kdl"
             return 0
         fi
-        # Check relative to repository root
-        if [ -f "$script_dir/../../../../config/includes.chroot/etc/zellij/agentic.kdl" ]; then
-            LAYOUT="$(cd "$script_dir/../../../../config/includes.chroot/etc/zellij" && pwd)/agentic.kdl"
+        # Check 5 levels up: relative to repository root from config/includes.chroot/usr/local/bin
+        if [ -f "$script_dir/../../../../../config/includes.chroot/etc/zellij/agentic.kdl" ]; then
+            LAYOUT="$(cd "$script_dir/../../../../../config/includes.chroot/etc/zellij" && pwd)/agentic.kdl"
             return 0
         fi
     fi
