@@ -1,0 +1,127 @@
+#!/bin/bash
+# ==============================================================================
+# AgenticOS: 0099-setup-agentic-user.hook.chroot
+#
+# Configures live user environment, permissions, and system optimizations:
+# 1. Passwordless sudo for default live user (user ALL=(ALL) NOPASSWD: ALL).
+# 2. Ensures target groups (sudo, input, video, audio, plugdev, netdev, dialout)
+#    exist and are assigned to the live user across both chroot and live-config.
+# 3. Configures zram-tools swap (ALGO=zstd, PERCENT=50, PRIORITY=100).
+# 4. Sets up /var/lib/agentic with proper permissions (01777).
+# 5. Configures volatile journald and sysctl write-wear mitigations for USB flash.
+# ==============================================================================
+set -euo pipefail
+
+echo "===================================================================="
+echo "==> [Hook] Initializing AgenticOS user environment and system tools..."
+echo "===================================================================="
+
+# ----------------------------------------------------------------------
+# 1. Passwordless Sudo Configuration
+# ----------------------------------------------------------------------
+echo "==> Configuring passwordless sudo for live user..."
+mkdir -p /etc/sudoers.d
+cat << 'EOF' > /etc/sudoers.d/01-agentic-user
+# AgenticOS Live User Passwordless Sudo
+user ALL=(ALL) NOPASSWD: ALL
+EOF
+chmod 0440 /etc/sudoers.d/01-agentic-user
+
+# Validate sudoers configuration syntax if visudo is available
+if command -v visudo >/dev/null 2>&1; then
+    visudo -c -f /etc/sudoers.d/01-agentic-user
+fi
+
+# ----------------------------------------------------------------------
+# 2. System Groups & User Setup
+# ----------------------------------------------------------------------
+echo "==> Ensuring required system groups exist..."
+TARGET_GROUPS=("sudo" "input" "video" "audio" "plugdev" "netdev" "dialout")
+for grp in "${TARGET_GROUPS[@]}"; do
+    if ! getent group "$grp" >/dev/null 2>&1; then
+        echo "  -> Creating missing group: $grp"
+        groupadd -r "$grp" 2>/dev/null || groupadd "$grp" 2>/dev/null || true
+    fi
+done
+
+# If user 'user' already exists in chroot, append to all target groups
+if id "user" >/dev/null 2>&1; then
+    echo "==> Assigning groups to existing 'user' account..."
+    usermod -aG "$(IFS=,; echo "${TARGET_GROUPS[*]}")" user || true
+fi
+
+# Configure live-config to automatically assign these groups upon boot creation
+echo "==> Configuring live-config default user and groups..."
+mkdir -p /etc/live/config.conf.d
+cat << 'EOF' > /etc/live/config.conf.d/01-agentic-user.conf
+# AgenticOS default live user groups
+LIVE_USERNAME="user"
+LIVE_USER_DEFAULT_GROUPS="sudo,input,video,audio,plugdev,netdev,dialout"
+EOF
+chmod 0644 /etc/live/config.conf.d/01-agentic-user.conf
+
+# ----------------------------------------------------------------------
+# 3. zRAM Swap Configuration (zram-tools)
+# ----------------------------------------------------------------------
+echo "==> Configuring zram-tools (zstd, 50% RAM, priority 100)..."
+mkdir -p /etc/default
+cat << 'EOF' > /etc/default/zramswap
+# Configuration for zram-tools
+# Compression algorithm for zRAM swap
+ALGO=zstd
+
+# Percentage of total RAM to allocate as zRAM swap
+PERCENT=50
+
+# Priority of zRAM swap device in /proc/swaps
+PRIORITY=100
+EOF
+chmod 0644 /etc/default/zramswap
+
+# Enable zramswap service via systemctl or direct target link
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable zramswap.service 2>/dev/null || true
+fi
+
+# Ensure systemd enable symlink exists even if systemctl is a dummy in chroot
+mkdir -p /etc/systemd/system/multi-user.target.wants
+for unit_path in /lib/systemd/system/zramswap.service /usr/lib/systemd/system/zramswap.service /etc/systemd/system/zramswap.service; do
+    if [ -f "$unit_path" ]; then
+        ln -sf "$unit_path" /etc/systemd/system/multi-user.target.wants/zramswap.service
+        break
+    fi
+done
+
+# ----------------------------------------------------------------------
+# 4. Agentic State Directory (/var/lib/agentic)
+# ----------------------------------------------------------------------
+echo "==> Setting up /var/lib/agentic..."
+mkdir -p /var/lib/agentic
+chmod 1777 /var/lib/agentic
+
+# ----------------------------------------------------------------------
+# 5. Write-Wear Optimizations for USB Live Media
+# ----------------------------------------------------------------------
+echo "==> Configuring systemd-journald volatile storage..."
+mkdir -p /etc/systemd/journald.conf.d
+cat << 'EOF' > /etc/systemd/journald.conf.d/01-volatile-storage.conf
+[Journal]
+# Use RAM-backed volatile journal to minimize USB flash drive write wear
+Storage=volatile
+RuntimeMaxUse=64M
+SystemMaxUse=64M
+EOF
+chmod 0644 /etc/systemd/journald.conf.d/01-volatile-storage.conf
+
+echo "==> Configuring sysctl writeback and swappiness optimizations..."
+mkdir -p /etc/sysctl.d
+cat << 'EOF' > /etc/sysctl.d/99-usb-flash-wear.conf
+# USB Flash write-wear mitigation & zRAM swappiness tuning
+vm.dirty_writeback_centisecs = 6000
+vm.dirty_expire_centisecs = 6000
+vm.vfs_cache_pressure = 50
+vm.swappiness = 100
+EOF
+chmod 0644 /etc/sysctl.d/99-usb-flash-wear.conf
+
+echo "==> [Hook] 0099-setup-agentic-user completed successfully."
