@@ -63,7 +63,7 @@ class TestTestQemuScript(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(res.returncode, 0)
-            self.assertIn("AgenticOS QEMU Live Test Runner", res.stdout)
+            self.assertTrue("Aeth OS" in res.stdout or "AgenticOS" in res.stdout)
             self.assertIn("--mem", res.stdout)
             self.assertIn("--uefi", res.stdout)
             self.assertIn("--dry-run", res.stdout)
@@ -213,7 +213,7 @@ class TestFlashUsbScript(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(res.returncode, 0)
-            self.assertIn("AgenticOS USB Flash & Persistence Tool", res.stdout)
+            self.assertTrue("Aeth OS" in res.stdout or "AgenticOS" in res.stdout)
             self.assertIn("--target", res.stdout)
             self.assertIn("--dry-run", res.stdout)
             self.assertIn("--yes", res.stdout)

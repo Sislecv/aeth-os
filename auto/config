@@ -8,7 +8,7 @@ lb config noauto \
     --archive-areas "main contrib non-free non-free-firmware" \
     --bootloader grub-efi \
     --binary-images iso-hybrid \
-    --image-name agentic-os-live-amd64 \
+    --image-name aeth-os-live-amd64 \
     --memtest none \
     --source false \
     "${@}"

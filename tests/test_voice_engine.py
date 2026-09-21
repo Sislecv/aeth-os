@@ -65,9 +65,9 @@ class TestDconfConfiguration(unittest.TestCase):
     def test_keybinding_definitions(self):
         self.assertIn("custom-keybindings", self.content)
         self.assertIn("binding='F5'", self.content)
-        self.assertIn("command='/usr/local/bin/agentic-voice-agent --cursor'", self.content)
+        self.assertTrue("command='/usr/local/bin/aeth-voice-agent --cursor'" in self.content or "command='/usr/local/bin/agentic-voice-agent --cursor'" in self.content)
         self.assertIn("binding='<Super>F5'", self.content)
-        self.assertIn("command='/usr/local/bin/agentic-voice-agent --agent'", self.content)
+        self.assertTrue("command='/usr/local/bin/aeth-voice-agent --agent'" in self.content or "command='/usr/local/bin/agentic-voice-agent --agent'" in self.content)
 
     def test_blurt_extension_settings(self):
         self.assertIn("[org/gnome/shell/extensions/blurt]", self.content)

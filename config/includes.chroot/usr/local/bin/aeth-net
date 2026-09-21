@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""
+Aeth OS: aeth-net - WiFi & Network Configuration CLI.
+
+Wraps NetworkManager CLI (nmcli) with structured output and graceful fallbacks:
+- aeth-net status (or --status): shows interfaces, IPs, connected SSID, signal, gateway, DNS.
+- aeth-net scan (or list): scans available WiFi networks (SSID, signal, security, in-use).
+- aeth-net connect <SSID> [password]: connects to WiFi network (interactive or non-interactive).
+- aeth-net disconnect [interface/ssid]: disconnects network interface or active connection.
+- aeth-net on / aeth-net off: toggles WiFi radio.
+
+Supports --help, --version, --json.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+VERSION = "1.0.0"
+
+
+def unescape_nmcli(val: str) -> str:
+    """Unescape colons and backslashes produced by nmcli -t."""
+    return val.replace(r"\:", ":").replace(r"\\", "\\")
+
+
+def split_nmcli_line(line: str) -> List[str]:
+    """Split nmcli -t line by unescaped colons."""
+    parts = re.split(r"(?<!\\):", line)
+    return [unescape_nmcli(p) for p in parts]
+
+
+def run_nmcli(args: List[str], timeout: int = 15) -> Tuple[int, str, str]:
+    """Run nmcli command safely with timeout."""
+    nmcli_bin = shutil.which("nmcli")
+    if not nmcli_bin:
+        return 127, "", "nmcli is not installed"
+    try:
+        res = subprocess.run(
+            [nmcli_bin] + args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return res.returncode, res.stdout, res.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "nmcli execution timed out"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+# ----------------------------------------------------------------------
+# 1. Fallback Diagnostics (when nmcli is absent or offline)
+# ----------------------------------------------------------------------
+def get_fallback_interfaces() -> List[Dict[str, Any]]:
+    """Gather basic network interface information directly from sysfs and procfs."""
+    interfaces: List[Dict[str, Any]] = []
+    sys_net = "/sys/class/net"
+    if not os.path.exists(sys_net):
+        return interfaces
+
+    # Find default gateway from /proc/net/route
+    default_gateway = None
+    default_iface = None
+    if os.path.exists("/proc/net/route"):
+        try:
+            with open("/proc/net/route", "r", encoding="utf-8") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.strip().split()
+                    if len(parts) >= 3 and parts[1] == "00000000":
+                        gw_hex = parts[2]
+                        if len(gw_hex) == 8:
+                            default_gateway = socket.inet_ntoa(struct.pack("<L", int(gw_hex, 16)))
+                            default_iface = parts[0]
+                            break
+        except Exception:
+            pass
+
+    # Find DNS servers from /etc/resolv.conf
+    dns_servers = []
+    if os.path.exists("/etc/resolv.conf"):
+        try:
+            with open("/etc/resolv.conf", "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("nameserver "):
+                        dns_servers.append(line.split()[1])
+        except Exception:
+            pass
+
+    for iface in sorted(os.listdir(sys_net)):
+        iface_dir = os.path.join(sys_net, iface)
+        if not os.path.isdir(iface_dir):
+            continue
+
+        is_wireless = os.path.exists(os.path.join(iface_dir, "wireless")) or os.path.exists(os.path.join(iface_dir, "phy80211"))
+        operstate = "unknown"
+        state_file = os.path.join(iface_dir, "operstate")
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    operstate = f.read().strip()
+            except Exception:
+                pass
+
+        iface_type = "wifi" if is_wireless else ("loopback" if iface == "lo" else "ethernet")
+
+        # Try to obtain IP address
+        ip_addr = None
+        if shutil.which("ip"):
+            try:
+                res = subprocess.run(
+                    ["ip", "-o", "-4", "addr", "show", iface],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+                m = re.search(r"inet\s+([0-9.]+)/", res.stdout)
+                if m:
+                    ip_addr = m.group(1)
+            except Exception:
+                pass
+
+        interfaces.append({
+            "device": iface,
+            "type": iface_type,
+            "state": "connected" if operstate == "up" else operstate,
+            "connection": iface if operstate == "up" else None,
+            "ip": ip_addr,
+            "gateway": default_gateway if iface == default_iface else None,
+            "dns": dns_servers if iface == default_iface else [],
+            "ssid": None,
+            "signal": None,
+        })
+
+    return interfaces
+
+
+# ----------------------------------------------------------------------
+# 2. Network Status
+# ----------------------------------------------------------------------
+def get_network_status() -> Dict[str, Any]:
+    """Retrieve full network status (interfaces, active WiFi, IPs, gateway, DNS)."""
+    status: Dict[str, Any] = {
+        "status": "disconnected",
+        "backend": "nmcli" if shutil.which("nmcli") else "fallback",
+        "wifi": {
+            "interface": None,
+            "connected": False,
+            "ssid": None,
+            "bssid": None,
+            "signal": None,
+            "security": None,
+            "ip": None,
+            "gateway": None,
+            "dns": [],
+        },
+        "interfaces": [],
+        "radio": {
+            "wifi_enabled": True,
+        },
+    }
+
+    if not shutil.which("nmcli"):
+        fallback_ifaces = get_fallback_interfaces()
+        status["interfaces"] = fallback_ifaces
+        for iface in fallback_ifaces:
+            if iface.get("state") == "connected" and iface.get("device") != "lo":
+                status["status"] = "connected"
+            if iface.get("type") == "wifi":
+                status["wifi"]["interface"] = iface.get("device")
+                status["wifi"]["connected"] = (iface.get("state") == "connected")
+                status["wifi"]["ip"] = iface.get("ip")
+                status["wifi"]["gateway"] = iface.get("gateway")
+                status["wifi"]["dns"] = iface.get("dns", [])
+        return status
+
+    # Query radio status
+    rc, stdout, _ = run_nmcli(["radio", "wifi"])
+    if rc == 0:
+        status["radio"]["wifi_enabled"] = ("enabled" in stdout.lower())
+
+    # Query devices
+    rc, stdout, _ = run_nmcli(["-t", "-m", "tabular", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"])
+    devices_info: Dict[str, Dict[str, Any]] = {}
+    if rc == 0:
+        for line in stdout.splitlines():
+            parts = split_nmcli_line(line.strip())
+            if len(parts) >= 3:
+                dev, dev_type, state = parts[0], parts[1], parts[2]
+                conn = parts[3] if len(parts) > 3 and parts[3] != "--" else None
+                devices_info[dev] = {
+                    "device": dev,
+                    "type": dev_type,
+                    "state": state,
+                    "connection": conn,
+                    "ip": None,
+                    "gateway": None,
+                    "dns": [],
+                    "ssid": None,
+                    "signal": None,
+                }
+                if state in ("connected", "connecting"):
+                    status["status"] = "connected"
+
+    # Query WiFi details if any wifi device present
+    rc_wifi, stdout_wifi, _ = run_nmcli(["-t", "-m", "tabular", "-f", "IN-USE,SSID,BSSID,SIGNAL,SECURITY,DEVICE", "dev", "wifi"])
+    active_wifi_dev = None
+    if rc_wifi == 0:
+        for line in stdout_wifi.splitlines():
+            parts = split_nmcli_line(line.strip())
+            if len(parts) >= 5:
+                in_use, ssid, bssid, signal_str, sec = parts[0], parts[1], parts[2], parts[3], parts[4]
+                dev = parts[5] if len(parts) > 5 else None
+                if in_use == "*":
+                    sig = int(signal_str) if signal_str.isdigit() else None
+                    status["wifi"]["connected"] = True
+                    status["wifi"]["ssid"] = ssid
+                    status["wifi"]["bssid"] = bssid
+                    status["wifi"]["signal"] = sig
+                    status["wifi"]["security"] = sec
+                    status["wifi"]["interface"] = dev
+                    active_wifi_dev = dev
+                    if dev and dev in devices_info:
+                        devices_info[dev]["ssid"] = ssid
+                        devices_info[dev]["signal"] = sig
+
+    # Detailed IP, Gateway, and DNS query for connected devices
+    for dev, d_info in devices_info.items():
+        if d_info["state"] == "connected":
+            rc_dev, stdout_dev, _ = run_nmcli(["-t", "-f", "IP4.ADDRESS,IP4.GATEWAY,IP4.DNS", "dev", "show", dev])
+            if rc_dev == 0:
+                dns_list = []
+                for line in stdout_dev.splitlines():
+                    p = split_nmcli_line(line.strip())
+                    if len(p) >= 2:
+                        k, v = p[0], p[1]
+                        if k.startswith("IP4.ADDRESS") and not d_info["ip"]:
+                            d_info["ip"] = v.split("/")[0]
+                        elif k.startswith("IP4.GATEWAY"):
+                            d_info["gateway"] = v
+                        elif k.startswith("IP4.DNS"):
+                            dns_list.append(v)
+                d_info["dns"] = dns_list
+                if dev == active_wifi_dev:
+                    status["wifi"]["ip"] = d_info["ip"]
+                    status["wifi"]["gateway"] = d_info["gateway"]
+                    status["wifi"]["dns"] = d_info["dns"]
+
+    status["interfaces"] = list(devices_info.values())
+    return status
+
+
+# ----------------------------------------------------------------------
+# 3. WiFi Scanning
+# ----------------------------------------------------------------------
+def scan_wifi_networks(rescan: bool = True) -> List[Dict[str, Any]]:
+    """Scan and list available WiFi access points."""
+    if not shutil.which("nmcli"):
+        return []
+
+    if rescan:
+        # Request background rescan (ignore errors if recently scanned)
+        run_nmcli(["dev", "wifi", "rescan"], timeout=5)
+
+    rc, stdout, _ = run_nmcli([
+        "-t", "-m", "tabular",
+        "-f", "IN-USE,SSID,BSSID,MODE,CHAN,FREQ,RATE,SIGNAL,BARS,SECURITY",
+        "dev", "wifi", "list"
+    ])
+
+    networks: List[Dict[str, Any]] = []
+    seen_keys = set()
+
+    if rc == 0:
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = split_nmcli_line(line)
+            if len(parts) >= 10:
+                in_use = (parts[0] == "*")
+                ssid = parts[1] or "<Hidden SSID>"
+                bssid = parts[2]
+                mode = parts[3]
+                chan = parts[4]
+                signal = int(parts[7]) if parts[7].isdigit() else 0
+                security = parts[9] or "OPEN"
+
+                # Deduplicate by (SSID, BSSID)
+                key = (ssid, bssid)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    networks.append({
+                        "in_use": in_use,
+                        "ssid": ssid,
+                        "bssid": bssid,
+                        "mode": mode,
+                        "channel": chan,
+                        "signal": signal,
+                        "security": security,
+                    })
+
+    # Sort networks: active first, then descending by signal strength
+    networks.sort(key=lambda x: (not x["in_use"], -x["signal"]))
+    return networks
+
+
+# ----------------------------------------------------------------------
+# 4. WiFi Connection & Disconnection
+# ----------------------------------------------------------------------
+def connect_wifi(
+    ssid: str,
+    password: Optional[str] = None,
+    hidden: bool = False,
+) -> Dict[str, Any]:
+    """Connect to a WiFi network with interactive password prompt fallback."""
+    if not shutil.which("nmcli"):
+        return {
+            "status": "error",
+            "message": "NetworkManager (nmcli) is not available on this system.",
+        }
+
+    # If password wasn't provided, inspect available networks to see if security is required
+    if password is None:
+        # Try to detect if network requires a password
+        scan_results = scan_wifi_networks(rescan=False)
+        target_net = next((n for n in scan_results if n["ssid"] == ssid), None)
+        if target_net and target_net["security"] not in ("OPEN", "--", ""):
+            # Interactive prompt if running in a terminal
+            if sys.stdin.isatty():
+                try:
+                    password = getpass.getpass(f"Enter password for WiFi '{ssid}': ")
+                except (EOFError, KeyboardInterrupt):
+                    return {"status": "error", "message": "Password prompt cancelled."}
+            else:
+                # Non-interactive and no password provided
+                return {
+                    "status": "error",
+                    "message": f"Network '{ssid}' requires security credentials, but no password was provided.",
+                }
+
+    cmd = ["dev", "wifi", "connect", ssid]
+    if password:
+        cmd.extend(["password", password])
+    if hidden:
+        cmd.extend(["hidden", "yes"])
+
+    rc, stdout, stderr = run_nmcli(cmd, timeout=30)
+    output = (stdout.strip() + " " + stderr.strip()).strip()
+
+    if rc == 0:
+        return {
+            "status": "success",
+            "ssid": ssid,
+            "message": output or f"Successfully activated connection to '{ssid}'.",
+        }
+    else:
+        return {
+            "status": "error",
+            "ssid": ssid,
+            "message": output or f"Failed to connect to '{ssid}'.",
+        }
+
+
+def disconnect_network(target: Optional[str] = None) -> Dict[str, Any]:
+    """Disconnect specific interface/SSID or the active connection."""
+    if not shutil.which("nmcli"):
+        return {
+            "status": "error",
+            "message": "NetworkManager (nmcli) is not available on this system.",
+        }
+
+    # If target is provided: check if it's an interface or a connection
+    if target:
+        # 1. Try disconnecting device
+        rc, stdout, stderr = run_nmcli(["dev", "disconnect", target], timeout=10)
+        if rc == 0:
+            return {"status": "success", "target": target, "message": f"Disconnected device '{target}'."}
+        # 2. Try disconnecting connection name
+        rc2, stdout2, stderr2 = run_nmcli(["con", "down", "id", target], timeout=10)
+        if rc2 == 0:
+            return {"status": "success", "target": target, "message": f"Deactivated connection '{target}'."}
+        return {
+            "status": "error",
+            "target": target,
+            "message": (stdout + " " + stderr + " " + stdout2 + " " + stderr2).strip(),
+        }
+
+    # If target not provided, find active wifi interface or primary connection
+    status = get_network_status()
+    wifi_iface = status.get("wifi", {}).get("interface")
+    if wifi_iface:
+        rc, stdout, stderr = run_nmcli(["dev", "disconnect", wifi_iface], timeout=10)
+        if rc == 0:
+            return {"status": "success", "target": wifi_iface, "message": f"Disconnected WiFi interface '{wifi_iface}'."}
+
+    # Fallback to disconnect active connections
+    for iface in status.get("interfaces", []):
+        conn = iface.get("connection")
+        if conn and iface.get("device") != "lo":
+            rc, stdout, stderr = run_nmcli(["con", "down", "id", conn], timeout=10)
+            if rc == 0:
+                return {"status": "success", "target": conn, "message": f"Deactivated connection '{conn}'."}
+
+    return {"status": "error", "message": "No active network connection found to disconnect."}
+
+
+def toggle_radio(enable: bool) -> Dict[str, Any]:
+    """Turn WiFi radio on or off."""
+    if not shutil.which("nmcli"):
+        return {
+            "status": "error",
+            "message": "NetworkManager (nmcli) is not available on this system.",
+        }
+
+    action = "on" if enable else "off"
+    rc, stdout, stderr = run_nmcli(["radio", "wifi", action])
+    if rc == 0:
+        return {
+            "status": "success",
+            "wifi_radio": "on" if enable else "off",
+            "message": f"WiFi radio turned {action}.",
+        }
+    else:
+        return {
+            "status": "error",
+            "message": (stdout + " " + stderr).strip() or f"Failed to turn WiFi {action}.",
+        }
+
+
+# ----------------------------------------------------------------------
+# 5. Formatters
+# ----------------------------------------------------------------------
+def format_status_report(status: Dict[str, Any]) -> str:
+    """Format status report into readable text."""
+    lines: List[str] = []
+    prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "aeth-net"
+    lines.append("=" * 64)
+    lines.append(f"  Aeth OS Network Status ({prog} v{VERSION})")
+    lines.append("=" * 64)
+
+    state_label = "[ONLINE]" if status.get("status") == "connected" else "[OFFLINE]"
+    lines.append(f"Overall State:   {state_label}")
+    lines.append(f"Network Backend: {status.get('backend')}")
+    radio_stat = "Enabled" if status.get("radio", {}).get("wifi_enabled") else "Disabled"
+    lines.append(f"WiFi Radio:      {radio_stat}")
+
+    wifi = status.get("wifi", {})
+    lines.append("\n[Active WiFi Connection]")
+    if wifi.get("connected"):
+        lines.append(f"  SSID:          {wifi.get('ssid')} ({wifi.get('bssid')})")
+        lines.append(f"  Signal:        {wifi.get('signal')}%")
+        lines.append(f"  Security:      {wifi.get('security') or 'OPEN'}")
+        lines.append(f"  Interface:     {wifi.get('interface')}")
+        lines.append(f"  IP Address:    {wifi.get('ip') or 'N/A'}")
+        lines.append(f"  Gateway:       {wifi.get('gateway') or 'N/A'}")
+        dns_str = ", ".join(wifi.get("dns", [])) if wifi.get("dns") else "None"
+        lines.append(f"  DNS Servers:   {dns_str}")
+    else:
+        lines.append("  Status:        Disconnected / No active WiFi connection")
+
+    lines.append("\n[Network Interfaces]")
+    lines.append(f"  {'DEVICE':<10} {'TYPE':<12} {'STATE':<14} {'IP ADDRESS':<18} {'CONNECTION'}")
+    lines.append("  " + "-" * 60)
+    for iface in status.get("interfaces", []):
+        dev = iface.get("device") or "unknown"
+        dev_type = iface.get("type") or "other"
+        st = iface.get("state") or "unknown"
+        ip = iface.get("ip") or "--"
+        conn = iface.get("connection") or "--"
+        lines.append(f"  {dev:<10} {dev_type:<12} {st:<14} {ip:<18} {conn}")
+
+    lines.append("=" * 64)
+    return "\n".join(lines)
+
+
+def format_scan_report(networks: List[Dict[str, Any]]) -> str:
+    """Format scanned WiFi networks into clean tabular text."""
+    if not networks:
+        return "No WiFi networks found (or wireless radio is disabled / unavailable)."
+
+    lines: List[str] = []
+    lines.append(f"{'IN-USE':<8} {'SSID':<28} {'SIGNAL':<8} {'SECURITY':<14} {'BSSID'}")
+    lines.append("-" * 72)
+    for net in networks:
+        in_use_str = "*" if net.get("in_use") else ""
+        ssid = net.get("ssid") or "<Hidden>"
+        if len(ssid) > 26:
+            ssid = ssid[:24] + ".."
+        sig_str = f"{net.get('signal', 0)}%"
+        sec = net.get("security") or "OPEN"
+        bssid = net.get("bssid") or ""
+        lines.append(f"{in_use_str:<8} {ssid:<28} {sig_str:<8} {sec:<14} {bssid}")
+
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# 6. Main CLI Entrypoint
+# ----------------------------------------------------------------------
+def main() -> int:
+    current_prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "aeth-net"
+    parser = argparse.ArgumentParser(
+        prog=current_prog,
+        description="Aeth OS WiFi & Networking CLI. Provides NetworkManager operations and status.",
+    )
+    parser.add_argument(
+        "--version",
+        "-v",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Format output as JSON for automated tooling and agents.",
+    )
+
+    # Subparsers for commands
+    subparsers = parser.add_subparsers(dest="command", help="Network command to execute")
+
+    # Command: status
+    parser_status = subparsers.add_parser("status", help="Show current network status and interfaces")
+    parser_status.add_argument("--json", action="store_true", help="JSON output")
+
+    # Command: scan / list
+    parser_scan = subparsers.add_parser("scan", aliases=["list"], help="Scan available WiFi networks")
+    parser_scan.add_argument("--json", action="store_true", help="JSON output")
+    parser_scan.add_argument("--no-rescan", action="store_true", help="Do not trigger active rescan before listing")
+
+    # Command: connect
+    parser_conn = subparsers.add_parser("connect", help="Connect to a WiFi network")
+    parser_conn.add_argument("ssid", help="Target WiFi SSID")
+    parser_conn.add_argument("password", nargs="?", default=None, help="WiFi password / pre-shared key (optional)")
+    parser_conn.add_argument("--hidden", action="store_true", help="SSID is hidden")
+    parser_conn.add_argument("--json", action="store_true", help="JSON output")
+
+    # Command: disconnect
+    parser_disc = subparsers.add_parser("disconnect", help="Disconnect active connection or specified interface")
+    parser_disc.add_argument("target", nargs="?", default=None, help="Interface or SSID to disconnect (optional)")
+    parser_disc.add_argument("--json", action="store_true", help="JSON output")
+
+    # Command: on
+    parser_on = subparsers.add_parser("on", help="Turn WiFi radio on")
+    parser_on.add_argument("--json", action="store_true", help="JSON output")
+
+    # Command: off
+    parser_off = subparsers.add_parser("off", help="Turn WiFi radio off")
+    parser_off.add_argument("--json", action="store_true", help="JSON output")
+
+    # Top-level fallback flags for status and scan
+    parser.add_argument("--status", action="store_true", help="Show network status")
+    parser.add_argument("--scan", action="store_true", help="Scan available WiFi networks")
+
+    args = parser.parse_args()
+
+    # Determine command
+    cmd = args.command
+    if args.status:
+        cmd = "status"
+    elif args.scan:
+        cmd = "scan"
+    elif not cmd:
+        cmd = "status"
+
+    use_json = args.json or getattr(args, "json", False)
+
+    # Dispatch commands
+    if cmd == "status":
+        res = get_network_status()
+        if use_json:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            print(format_status_report(res))
+        return 0
+
+    elif cmd in ("scan", "list"):
+        do_rescan = not getattr(args, "no_rescan", False)
+        res = scan_wifi_networks(rescan=do_rescan)
+        if use_json:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            print(format_scan_report(res))
+        return 0
+
+    elif cmd == "connect":
+        res = connect_wifi(args.ssid, password=args.password, hidden=args.hidden)
+        if use_json:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            if res.get("status") == "success":
+                print(f"[OK] {res.get('message')}")
+            else:
+                print(f"[ERROR] {res.get('message')}", file=sys.stderr)
+        return 0 if res.get("status") == "success" else 1
+
+    elif cmd == "disconnect":
+        res = disconnect_network(args.target)
+        if use_json:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            if res.get("status") == "success":
+                print(f"[OK] {res.get('message')}")
+            else:
+                print(f"[ERROR] {res.get('message')}", file=sys.stderr)
+        return 0 if res.get("status") == "success" else 1
+
+    elif cmd == "on":
+        res = toggle_radio(enable=True)
+        if use_json:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            if res.get("status") == "success":
+                print(f"[OK] {res.get('message')}")
+            else:
+                print(f"[ERROR] {res.get('message')}", file=sys.stderr)
+        return 0 if res.get("status") == "success" else 1
+
+    elif cmd == "off":
+        res = toggle_radio(enable=False)
+        if use_json:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            if res.get("status") == "success":
+                print(f"[OK] {res.get('message')}")
+            else:
+                print(f"[ERROR] {res.get('message')}", file=sys.stderr)
+        return 0 if res.get("status") == "success" else 1
+
+    else:
+        parser.print_help()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -25,6 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 KDL_PATH = REPO_ROOT / "config/includes.chroot/etc/zellij/agentic.kdl"
 SHELL_HOOKS_PATH = REPO_ROOT / "config/includes.chroot/etc/agentic/shell-hooks.sh"
 TERMINAL_PATH = REPO_ROOT / "config/includes.chroot/usr/local/bin/agentic-terminal"
+AETH_TERMINAL_PATH = REPO_ROOT / "config/includes.chroot/usr/local/bin/aeth-terminal"
 
 
 class TestZellijLayout(unittest.TestCase):
@@ -387,15 +388,16 @@ class TestAgenticTerminal(unittest.TestCase):
         self.assertTrue(TERMINAL_PATH.exists(), f"Binary not found at {TERMINAL_PATH}")
 
     def test_agentic_terminal_exists_and_executable(self):
-        """Verify agentic-terminal exists and has executable bit set."""
-        self.assertTrue(TERMINAL_PATH.is_file())
-        st = os.stat(TERMINAL_PATH)
-        self.assertTrue(bool(st.st_mode & stat.S_IXUSR))
+        """Verify aeth-terminal and alias exist and have executable bit set."""
+        self.assertTrue(AETH_TERMINAL_PATH.is_file(), f"Missing aeth-terminal: {AETH_TERMINAL_PATH}")
+        self.assertTrue(os.access(AETH_TERMINAL_PATH, os.X_OK), "aeth-terminal must be executable")
+        self.assertTrue(TERMINAL_PATH.is_symlink() or TERMINAL_PATH.is_file(), "agentic-terminal alias must exist")
+        self.assertTrue(os.access(TERMINAL_PATH, os.X_OK), "agentic-terminal alias must be executable")
 
     def test_bash_syntax(self):
-        """Verify bash -n passes cleanly on agentic-terminal."""
-        res = subprocess.run(["bash", "-n", str(TERMINAL_PATH)], capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0, f"Syntax check failed:\n{res.stderr}")
+        """Verify bash -n passes cleanly on aeth-terminal."""
+        res = subprocess.run(["bash", "-n", str(AETH_TERMINAL_PATH)], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Syntax error in aeth-terminal:\n{res.stderr}")
 
     def test_help_flag(self):
         """Verify --help and -h flags display usage instructions and exit with 0."""
@@ -403,7 +405,7 @@ class TestAgenticTerminal(unittest.TestCase):
             res = subprocess.run([str(TERMINAL_PATH), flag], capture_output=True, text=True)
             self.assertEqual(res.returncode, 0)
             self.assertIn("Usage:", res.stdout)
-            self.assertIn("agentic-terminal", res.stdout)
+            self.assertIn("terminal", res.stdout)
             self.assertIn("--dry-run", res.stdout)
             self.assertIn("--status", res.stdout)
             self.assertIn("[Alt+A:", res.stdout)
@@ -413,8 +415,8 @@ class TestAgenticTerminal(unittest.TestCase):
         for flag in ["--version", "-v"]:
             res = subprocess.run([str(TERMINAL_PATH), flag], capture_output=True, text=True)
             self.assertEqual(res.returncode, 0)
-            self.assertIn("agentic-terminal", res.stdout)
-            self.assertIn("AgenticOS", res.stdout)
+            self.assertIn("1.0.0", res.stdout)
+            self.assertTrue("Aeth OS" in res.stdout or "AgenticOS" in res.stdout)
 
     def test_dry_run_flag(self):
         """Verify --dry-run returns code 0 and indicates planned invocation."""

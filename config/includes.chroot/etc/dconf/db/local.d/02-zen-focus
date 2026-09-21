@@ -1,5 +1,5 @@
 # ==============================================================================
-# AgenticOS: Zen Focus Mode & Window Focus Configuration
+# Aeth OS: Zen Focus Mode & Window Focus Configuration
 # ==============================================================================
 
 # Custom Keybinding for Zen Focus Mode (Super+F11)
@@ -8,7 +8,7 @@ custom-keybindings=['/org/gnome/settings-daemon/plugins/media-keys/custom-keybin
 
 [org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0]
 binding='<Super>F11'
-command='/usr/local/bin/agentic-zen-toggle'
+command='/usr/local/bin/aeth-zen-toggle'
 name='Zen Focus Mode'
 
 # Focus Preferences

@@ -1,5 +1,5 @@
 # ==============================================================================
-# AgenticOS: Blurt Voice Integration & Keybindings Configuration
+# Aeth OS: Blurt Voice Integration & Keybindings Configuration
 # ==============================================================================
 
 # Custom Keybindings for Voice Agent:
@@ -10,12 +10,12 @@ custom-keybindings=['/org/gnome/settings-daemon/plugins/media-keys/custom-keybin
 
 [org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1]
 binding='F5'
-command='/usr/local/bin/agentic-voice-agent --cursor'
+command='/usr/local/bin/aeth-voice-agent --cursor'
 name='Voice Dictation to Cursor'
 
 [org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom2]
 binding='<Super>F5'
-command='/usr/local/bin/agentic-voice-agent --agent'
+command='/usr/local/bin/aeth-voice-agent --agent'
 name='Voice Prompt to Pi Agent'
 
 # Blurt GNOME Shell Extension configuration

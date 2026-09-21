@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""
+AgenticOS Voice Agent (agentic-voice-agent)
+
+Provides local offline speech-to-text dictation and direct voice-to-agent prompt dispatch:
+- --cursor: Records audio with VAD silence stop, runs whisper-cpp, types transcription
+            into the currently focused window via wtype or clipboard paste.
+- --agent: Records audio with VAD silence stop, runs whisper-cpp, sends transcription
+           directly to companion Pi Agent via Unix domain socket (/run/user/$UID/agentic.sock)
+           or Zellij CLI.
+- --status: Outputs JSON describing audio recording tools, whisper-cpp binary, model, and IPC socket.
+- --dry-run: Simulates the recording and transcription pipeline without capturing audio.
+- --model PATH: Overrides whisper.cpp model path.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+VERSION = "1.0.0"
+DEFAULT_MODEL_PATH = "/usr/share/agentic/models/whisper/ggml-base.bin"
+FALLBACK_MODEL_DIR = "/usr/share/agentic/models/whisper"
+
+
+def find_audio_recorder():
+    """Detect available audio recording backend in order of preference."""
+    # Preferred order: sox (rec), pw-record, parecord, arecord
+    rec_tool = None
+    if shutil.which("sox") or shutil.which("rec"):
+        rec_tool = "sox"
+    elif shutil.which("pw-record"):
+        rec_tool = "pw-record"
+    elif shutil.which("parecord"):
+        rec_tool = "parecord"
+    elif shutil.which("arecord"):
+        rec_tool = "arecord"
+    return rec_tool
+
+
+def find_whisper_binary():
+    """Find whisper-cpp or fallback mock executable."""
+    candidates = [
+        "/usr/local/bin/whisper-cpp",
+        "/usr/bin/whisper-cpp",
+        shutil.which("whisper-cpp"),
+        shutil.which("whisper-cli"),
+        shutil.which("whisper"),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return str(Path(c).resolve())
+    return None
+
+
+def get_agentic_socket_path():
+    """Resolve active Agentic IPC socket path."""
+    if os.environ.get("AGENTIC_SOCK"):
+        return os.environ["AGENTIC_SOCK"]
+    uid = os.getuid() if hasattr(os, "getuid") else 1000
+    run_user_sock = f"/run/user/{uid}/agentic.sock"
+    tmp_sock = f"/tmp/agentic-{uid}.sock"
+    if os.path.exists(run_user_sock):
+        return run_user_sock
+    if os.path.exists(tmp_sock):
+        return tmp_sock
+    if os.path.isdir(f"/run/user/{uid}"):
+        return run_user_sock
+    return tmp_sock
+
+
+def check_status(model_path=None):
+    """Inspect environment and return detailed JSON status dict."""
+    model = model_path or os.environ.get("WHISPER_MODEL", DEFAULT_MODEL_PATH)
+    rec = find_audio_recorder()
+    w_bin = find_whisper_binary()
+    sock = get_agentic_socket_path()
+    has_wtype = shutil.which("wtype") is not None
+    has_xdotool = shutil.which("xdotool") is not None
+    has_wl_copy = shutil.which("wl-copy") is not None
+
+    status_data = {
+        "status": "ok" if (w_bin and os.path.exists(model)) else "degraded",
+        "version": VERSION,
+        "audio_recorder": {
+            "available": rec is not None,
+            "tool": rec,
+            "path": shutil.which(rec) if rec else None,
+            "supported_backends": ["sox", "pw-record", "parecord", "arecord"]
+        },
+        "whisper": {
+            "binary": w_bin,
+            "available": w_bin is not None,
+            "model_path": model,
+            "model_exists": os.path.exists(model),
+            "model_size_bytes": os.path.getsize(model) if os.path.exists(model) else 0
+        },
+        "text_injection": {
+            "wtype": has_wtype,
+            "xdotool": has_xdotool,
+            "wl_copy": has_wl_copy,
+            "preferred": "wtype" if has_wtype else ("xdotool" if has_xdotool else "clipboard_fallback")
+        },
+        "agent_socket": {
+            "path": sock,
+            "active": os.path.exists(sock) and stat_is_socket(sock)
+        },
+        "vad_silence_timeout": 1.0
+    }
+    return status_data
+
+
+def stat_is_socket(path):
+    try:
+        import stat
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except Exception:
+        return False
+
+
+def notify_user(title, message, icon="audio-input-microphone", timeout=2000):
+    """Send desktop notification if notify-send is available."""
+    if shutil.which("notify-send"):
+        try:
+            subprocess.run(
+                ["notify-send", "-t", str(timeout), "-a", "Agentic Voice", "-i", icon, title, message],
+                capture_output=True,
+                check=False
+            )
+        except Exception:
+            pass
+
+
+def play_audio_feedback(sound_name="message-new-instant"):
+    """Subtle audio feedback via canberra-gtk-play or pw-play."""
+    if shutil.which("canberra-gtk-play"):
+        try:
+            subprocess.run(["canberra-gtk-play", "-i", sound_name, "-d", "Agentic Voice"],
+                           capture_output=True, check=False)
+        except Exception:
+            pass
+
+
+def build_record_command(output_wav, duration=30, vad_silence=1.0):
+    """Build the command to record audio with 16kHz 16-bit mono WAV and VAD silence detection."""
+    rec = find_audio_recorder()
+    if rec == "sox" or shutil.which("rec"):
+        tool = shutil.which("rec") or "sox"
+        # rec -r 16000 -c 1 -b 16 output_wav silence 1 0.1 3% 1 1.0 3%
+        if tool.endswith("rec"):
+            cmd = [
+                tool, "-q", "-r", "16000", "-c", "1", "-b", "16", output_wav,
+                "silence", "1", "0.1", "2%", "1", str(vad_silence), "2%"
+            ]
+        else:
+            cmd = [
+                tool, "-q", "-d", "-r", "16000", "-c", "1", "-b", "16", output_wav,
+                "silence", "1", "0.1", "2%", "1", str(vad_silence), "2%"
+            ]
+    elif rec == "arecord":
+        cmd = [
+            "arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1",
+            "-d", str(int(duration)), output_wav
+        ]
+    elif rec == "pw-record":
+        cmd = [
+            "pw-record", "--rate", "16000", "--channels", "1", "--format", "s16",
+            output_wav
+        ]
+    elif rec == "parecord":
+        cmd = [
+            "parecord", "--rate=16000", "--channels=1", "--format=s16le",
+            output_wav
+        ]
+    else:
+        # Fallback simulation or mock command
+        cmd = ["echo", "mock-record", output_wav]
+    return cmd
+
+
+def record_audio(output_wav, duration=30, vad_silence=1.0, dry_run=False):
+    """Record microphone audio to 16kHz mono WAV."""
+    if dry_run:
+        print(f"[dry-run] Would record audio to {output_wav} with VAD silence stop {vad_silence}s (max {duration}s)")
+        return True
+
+    cmd = build_record_command(output_wav, duration=duration, vad_silence=vad_silence)
+    rec = find_audio_recorder()
+
+    if not rec:
+        # No audio recording hardware/binary installed
+        print("Warning: No audio recording tool (sox/arecord/pw-record) detected on system.", file=sys.stderr)
+        return False
+
+    try:
+        # If tool doesn't have native silence detection (like arecord/pw-record), limit max duration
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            proc.wait(timeout=duration)
+        except subprocess.TimeoutExpired:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        return os.path.exists(output_wav) and os.path.getsize(output_wav) > 0
+    except Exception as e:
+        print(f"Error recording audio: {e}", file=sys.stderr)
+        return False
+
+
+def run_whisper_transcribe(wav_path, model_path, language="auto", dry_run=False):
+    """Execute whisper-cpp on wav_path and return transcribed text."""
+    if dry_run:
+        print(f"[dry-run] Would execute whisper-cpp on {wav_path} with model {model_path} (language: {language})")
+        return "Simulated transcription from voice input."
+
+    whisper_bin = find_whisper_binary()
+    if not whisper_bin:
+        raise FileNotFoundError("whisper-cpp executable not found in PATH or standard locations.")
+
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Whisper model file not found at {model_path}")
+
+    # Run whisper-cpp
+    cmd = [
+        whisper_bin,
+        "-m", model_path,
+        "-f", wav_path,
+        "-l", language,
+        "--no-timestamps"
+    ]
+
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    raw_output = res.stdout
+    if not raw_output and res.stderr:
+        raw_output = res.stderr
+
+    # Clean whisper output: remove timestamps, special tokens [BLANK_AUDIO], etc.
+    cleaned = re.sub(r"\[\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}\]", "", raw_output)
+    cleaned = re.sub(r"\[_TT_\d+\]", "", cleaned)
+    cleaned = re.sub(r"\[BLANK_AUDIO\]", "", cleaned, flags=re.IGNORECASE)
+
+    # Filter non-transcription log lines from whisper.cpp
+    lines = []
+    for line in cleaned.splitlines():
+        line_s = line.strip()
+        if not line_s:
+            continue
+        # Skip internal whisper-cpp status logs
+        if any(line_s.startswith(prefix) for prefix in [
+            "whisper_init", "whisper_model", "system_info", "main:", "whisper_print", "load_model:"
+        ]):
+            continue
+        lines.append(line_s)
+
+    text = " ".join(lines).strip()
+    return text
+
+
+def inject_text_at_cursor(text, dry_run=False):
+    """Inject transcribed text into the currently active window/cursor."""
+    if dry_run:
+        print(f"[dry-run] Would inject text into active window: {text!r}")
+        return True
+
+    if not text:
+        return False
+
+    # Attempt 1: wtype (Wayland standard)
+    if shutil.which("wtype"):
+        try:
+            # Add small delay so key release doesn't conflict
+            time.sleep(0.05)
+            res = subprocess.run(["wtype", text], capture_output=True, text=True, check=False)
+            if res.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+    # Attempt 2: xdotool (X11 / XWayland fallback)
+    if shutil.which("xdotool"):
+        try:
+            res = subprocess.run(["xdotool", "type", "--clearmodifiers", "--", text],
+                                 capture_output=True, text=True, check=False)
+            if res.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+    # Attempt 3: Clipboard paste fallback via wl-copy or xclip
+    if shutil.which("wl-copy"):
+        try:
+            subprocess.run(["wl-copy", text], check=True)
+            if shutil.which("wtype"):
+                subprocess.run(["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"], check=False)
+            return True
+        except Exception:
+            pass
+
+    print(f"[agentic-voice-agent] Transcribed text: {text}")
+    return True
+
+
+def dispatch_to_pi_agent(text, dry_run=False):
+    """Send transcribed prompt to companion Pi Agent via Unix socket or Zellij."""
+    if dry_run:
+        print(f"[dry-run] Would dispatch voice prompt to Pi Agent: {text!r}")
+        return True
+
+    if not text:
+        return False
+
+    dispatched = False
+
+    # 1. Try Agentic IPC Unix Domain Socket
+    sock_path = get_agentic_socket_path()
+    if os.path.exists(sock_path) and stat_is_socket(sock_path):
+        try:
+            payload = {
+                "event": "voice_prompt",
+                "source": "blurt_voice_agent",
+                "text": text,
+                "timestamp": int(time.time()),
+                "action": "prompt"
+            }
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(sock_path)
+            s.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+            s.close()
+            dispatched = True
+        except Exception as e:
+            print(f"Notice: Failed to deliver via socket {sock_path}: {e}", file=sys.stderr)
+
+    # 2. Try Zellij companion pane write if inside or managing Zellij
+    if shutil.which("zellij"):
+        try:
+            # Focus companion pane or write chars
+            # In Zellij companion layout, right pane is Pi companion
+            subprocess.run(["zellij", "action", "write-chars", text], capture_output=True, check=False)
+            subprocess.run(["zellij", "action", "write", "10"], capture_output=True, check=False) # Enter
+            dispatched = True
+        except Exception:
+            pass
+
+    if not dispatched:
+        # Fallback: print to stdout or notify
+        print(f"[voice-to-agent] {text}")
+        notify_user("Voice to Pi Agent", text)
+        return True
+
+    notify_user("Voice sent to Pi Agent", text)
+    return True
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="AgenticOS Local Voice Agent (whisper.cpp & Blurt integration)"
+    )
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("--cursor", action="store_true", help="Record audio and type transcription at cursor")
+    parser.add_argument("--agent", action="store_true", help="Record audio and send transcription to Pi Agent")
+    parser.add_argument("--status", action="store_true", help="Output JSON status of voice engine stack")
+    parser.add_argument("--dry-run", action="store_true", help="Print execution steps without recording audio")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL_PATH, help="Path to whisper ggml model file")
+    parser.add_argument("--language", "-l", type=str, default="auto", help="Transcription language (default: auto)")
+    parser.add_argument("--audio-file", type=str, help="Transcribe an existing audio file instead of microphone")
+    parser.add_argument("--text", type=str, help="Inject or dispatch provided text directly (skip recording/whisper)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.status:
+        st = check_status(model_path=args.model)
+        print(json.dumps(st, indent=2))
+        return 0
+
+    if not args.cursor and not args.agent:
+        # Default behavior if no action specified: display status or help
+        st = check_status(model_path=args.model)
+        print(json.dumps(st, indent=2))
+        return 0
+
+    model = args.model
+    # Validate model or check fallback
+    if not os.path.exists(model) and not args.dry_run and not args.text:
+        # Check fallback directory
+        alt_model = os.path.join(FALLBACK_MODEL_DIR, "ggml-base.bin")
+        if os.path.exists(alt_model):
+            model = alt_model
+        else:
+            msg = f"Whisper model not found at {model}."
+            print(f"Error: {msg}", file=sys.stderr)
+            notify_user("Voice Engine Error", msg, icon="dialog-error")
+            return 1
+
+    transcribed_text = ""
+
+    if args.text:
+        transcribed_text = args.text
+    elif args.audio_file:
+        if not os.path.isfile(args.audio_file) and not args.dry_run:
+            print(f"Error: Audio file not found: {args.audio_file}", file=sys.stderr)
+            return 1
+        transcribed_text = run_whisper_transcribe(
+            args.audio_file, model, language=args.language, dry_run=args.dry_run
+        )
+    else:
+        # Record microphone audio
+        play_audio_feedback("message-new-instant")
+        notify_user("Agentic Voice", "Listening... Speak now.", timeout=1500)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+            tmp_wav_path = tmp_wav.name
+
+        try:
+            recorded = record_audio(tmp_wav_path, duration=30, vad_silence=1.0, dry_run=args.dry_run)
+            if not recorded and not args.dry_run:
+                notify_user("Agentic Voice", "No audio recorded or recording cancelled.")
+                return 1
+
+            play_audio_feedback("dialog-information")
+            transcribed_text = run_whisper_transcribe(
+                tmp_wav_path, model, language=args.language, dry_run=args.dry_run
+            )
+        finally:
+            if os.path.exists(tmp_wav_path):
+                try:
+                    os.remove(tmp_wav_path)
+                except Exception:
+                    pass
+
+    if args.cursor:
+        ok = inject_text_at_cursor(transcribed_text, dry_run=args.dry_run)
+        return 0 if ok else 1
+
+    if args.agent:
+        ok = dispatch_to_pi_agent(transcribed_text, dry_run=args.dry_run)
+        return 0 if ok else 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

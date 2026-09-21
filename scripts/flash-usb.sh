@@ -25,7 +25,7 @@ DRY_RUN=false
 
 show_help() {
     cat << 'EOF'
-AgenticOS USB Flash & Persistence Tool
+Aeth OS USB Flash & Persistence Tool
 
 Usage:
   flash-usb.sh [OPTIONS] <TARGET_DEVICE>
@@ -131,6 +131,7 @@ find_iso() {
     # Search candidates in current directory and repo root
     local search_dirs=("$PWD" "$REPO_ROOT")
     local candidates=(
+        "aeth-os-live-amd64.hybrid.iso"
         "agentic-os-live-amd64.hybrid.iso"
         "live-image-amd64.hybrid.iso"
     )
@@ -151,7 +152,7 @@ find_iso() {
     done
 
     if [ "$DRY_RUN" = true ]; then
-        echo "agentic-os-live-amd64.hybrid.iso"
+        echo "aeth-os-live-amd64.hybrid.iso"
         return 0
     fi
 

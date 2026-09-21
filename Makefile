@@ -12,7 +12,7 @@ config:
 	./auto/config
 
 build:
-	@echo "==> Building AgenticOS Live ISO..."
+	@echo "==> Building Aeth OS Live ISO..."
 	$(SUDO) ./auto/build
 
 clean:
@@ -23,7 +23,7 @@ test-qemu:
 	@if [ -f scripts/test-qemu.sh ]; then \
 		./scripts/test-qemu.sh; \
 	else \
-		echo "scripts/test-qemu.sh not found (will be provided in Task 10)."; \
+		echo "scripts/test-qemu.sh not found."; \
 		exit 1; \
 	fi
 
@@ -35,12 +35,12 @@ flash-usb:
 	@if [ -f scripts/flash-usb.sh ]; then \
 		$(SUDO) ./scripts/flash-usb.sh $(DEVICE); \
 	else \
-		echo "scripts/flash-usb.sh not found (will be provided in Task 10)."; \
+		echo "scripts/flash-usb.sh not found."; \
 		exit 1; \
 	fi
 
 help:
-	@echo "AgenticOS Build System"
+	@echo "Aeth OS Build System"
 	@echo ""
 	@echo "Usage:"
 	@echo "  make [target] [DEVICE=/dev/sdX]"

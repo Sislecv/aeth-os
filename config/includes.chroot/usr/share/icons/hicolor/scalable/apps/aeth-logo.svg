@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background Slate Gradient -->
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#181A22"/>
+      <stop offset="50%" stop-color="#121319"/>
+      <stop offset="100%" stop-color="#0B0C10"/>
+    </linearGradient>
+
+    <!-- Outer Squircle Subtle Border Gradient -->
+    <linearGradient id="borderGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00F5D4" stop-opacity="0.6"/>
+      <stop offset="40%" stop-color="#00BBF9" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#9D4EDD" stop-opacity="0.5"/>
+    </linearGradient>
+
+    <!-- Aether Cyan-Blue Gradient (Left Wing) -->
+    <linearGradient id="aetherTeal" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00F5D4"/>
+      <stop offset="50%" stop-color="#00BBF9"/>
+      <stop offset="100%" stop-color="#4361EE"/>
+    </linearGradient>
+
+    <!-- Aether Purple-Violet Gradient (Right Wing & Loop) -->
+    <linearGradient id="aetherPurple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4361EE"/>
+      <stop offset="50%" stop-color="#7209B7"/>
+      <stop offset="100%" stop-color="#F72585"/>
+    </linearGradient>
+
+    <!-- Ambient Core Glow Filter -->
+    <filter id="ambientGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="24" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+
+    <!-- Core Dot Intense Glow Filter -->
+    <filter id="coreGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="12" result="blur1"/>
+      <feGaussianBlur stdDeviation="4" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Soft Drop Shadow -->
+    <filter id="dropShadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="16" stdDeviation="20" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <!-- 1. Background Squircle with Ambient Shadow -->
+  <rect x="24" y="24" width="464" height="464" rx="116" ry="116"
+        fill="url(#bgGradient)"
+        stroke="url(#borderGradient)"
+        stroke-width="3"
+        filter="url(#dropShadow)"/>
+
+  <!-- 2. Ambient Aether Nebula Backdrop (Subtle) -->
+  <circle cx="210" cy="220" r="140" fill="#00BBF9" opacity="0.10" filter="url(#ambientGlow)"/>
+  <circle cx="310" cy="300" r="130" fill="#7209B7" opacity="0.12" filter="url(#ambientGlow)"/>
+
+  <!-- 3. Dynamic "A" Glyph composed of Flowing Stream Lines -->
+  <!-- Left Ascending Stream (Aether Left Leg) -->
+  <path d="M 148 376 
+           C 152 350, 172 290, 206 216 
+           C 230 164, 246 128, 256 104
+           C 258 100, 264 100, 267 104
+           C 272 114, 280 134, 290 158
+           C 276 190, 260 234, 242 278
+           C 222 328, 196 366, 174 380
+           C 160 388, 146 386, 148 376 Z"
+        fill="url(#aetherTeal)"/>
+
+  <!-- Right Descending & Looping Stream (Aether Right Leg & Infinite Flow) -->
+  <path d="M 264 104
+           C 278 134, 308 208, 334 274
+           C 356 328, 376 366, 362 378
+           C 346 392, 312 366, 282 326
+           C 264 302, 256 278, 266 264
+           C 274 252, 294 256, 304 272
+           C 318 296, 332 316, 342 320
+           C 346 322, 348 316, 344 306
+           C 328 266, 304 204, 280 148
+           C 272 130, 266 114, 264 104 Z"
+        fill="url(#aetherPurple)"/>
+
+  <!-- Horizontal Agentic Bridge (Connecting Crossbar with Dynamic Arch) -->
+  <path d="M 188 288
+           C 218 268, 252 258, 294 260
+           C 324 262, 342 270, 348 276
+           C 350 278, 346 284, 338 284
+           C 304 282, 268 290, 232 308
+           C 208 320, 192 328, 186 322
+           C 182 318, 182 300, 188 288 Z"
+        fill="url(#aetherTeal)"
+        opacity="0.95"/>
+
+  <!-- 4. The Agent Core (The Luminous Eye of Aeth OS) -->
+  <circle cx="256" cy="232" r="18" fill="#FFFFFF" filter="url(#coreGlow)"/>
+  <circle cx="256" cy="232" r="10" fill="#00F5D4"/>
+  <circle cx="256" cy="232" r="4" fill="#FFFFFF"/>
+
+  <!-- 5. Modern Corner Accent Micro-Dots (Material 3 Precision Details) -->
+  <circle cx="72" cy="72" r="4" fill="#00F5D4" opacity="0.4"/>
+  <circle cx="440" cy="72" r="4" fill="#9D4EDD" opacity="0.4"/>
+  <circle cx="440" cy="440" r="4" fill="#00BBF9" opacity="0.4"/>
+  <circle cx="72" cy="440" r="4" fill="#7209B7" opacity="0.4"/>
+</svg>

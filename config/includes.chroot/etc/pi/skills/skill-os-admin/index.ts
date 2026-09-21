@@ -64,13 +64,15 @@ export const tools: PiToolDefinition[] = [
       properties: {},
     },
     async execute(_arg1?: any, _arg2?: any) {
-      const piDoctorBin = resolveBinary("pi-doctor", "PI_DOCTOR_BIN");
-      if (fs.existsSync(piDoctorBin)) {
-        const proc = spawnSync(piDoctorBin, ["--json"], { encoding: "utf-8", timeout: 10000 });
+      const doctorBin = resolveBinary("aeth-doctor", "AETH_DOCTOR_BIN");
+      const fallbackBin = resolveBinary("pi-doctor", "PI_DOCTOR_BIN");
+      const targetBin = fs.existsSync(doctorBin) ? doctorBin : fallbackBin;
+      if (fs.existsSync(targetBin)) {
+        const proc = spawnSync(targetBin, ["--json"], { encoding: "utf-8", timeout: 10000 });
         if (proc.status === 0 && proc.stdout) {
           return {
             content: [{ type: "text", text: proc.stdout }],
-            details: { source: "pi-doctor" },
+            details: { source: "aeth-doctor" },
           };
         }
       }

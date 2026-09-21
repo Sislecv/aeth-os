@@ -38,7 +38,7 @@ OVMF_SEARCH_PATHS=(
 
 show_help() {
     cat << 'EOF'
-AgenticOS QEMU Live Test Runner
+Aeth OS QEMU Live Test Runner
 
 Usage:
   test-qemu.sh [OPTIONS] [ISO_PATH]
@@ -162,6 +162,7 @@ find_iso() {
     # Search candidates in current directory and repo root
     local search_dirs=("$PWD" "$REPO_ROOT")
     local candidates=(
+        "aeth-os-live-amd64.hybrid.iso"
         "agentic-os-live-amd64.hybrid.iso"
         "live-image-amd64.hybrid.iso"
     )

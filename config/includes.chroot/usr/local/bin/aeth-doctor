@@ -1,0 +1,814 @@
+#!/usr/bin/env python3
+"""
+Aeth OS: aeth-doctor - System Health, Hardware Diagnostics & Agentic Runtime Inspector.
+
+Gathers and reports hardware health, resource utilization, and runtime environment:
+- CPU: model, core count, load averages, temperature (sysfs / lm-sensors).
+- Memory & Swap: physical RAM (total/used/free), zRAM swap status (active, algorithm zstd, compression ratio).
+- GPU & Hardware Acceleration: GPU vendor/device (lspci/drm/vulkan), driver status.
+- Power & Battery: battery level, charging status, AC power (/sys/class/power_supply).
+- Storage & Persistence: mounted partitions, persistence overlay health, write-wear optimizations (commit=60, noatime).
+- Agentic Environment: Agentic IPC socket, Ghost Workspace daemon status, Ollama/Pi service status.
+
+Supports --help, --version, --json, --quick.
+"""
+
+import argparse
+import glob
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+VERSION = "1.0.0"
+
+
+# ----------------------------------------------------------------------
+# 1. CPU Diagnostics
+# ----------------------------------------------------------------------
+def get_cpu_info(quick: bool = False) -> Dict[str, Any]:
+    """Inspect CPU model, cores, load averages, and thermal status."""
+    info: Dict[str, Any] = {
+        "model": "Unknown CPU",
+        "arch": platform.machine(),
+        "cores_logical": os.cpu_count() or 1,
+        "cores_physical": None,
+        "load_average": [0.0, 0.0, 0.0],
+        "temperature_c": None,
+        "governor": None,
+    }
+
+    # Load average
+    try:
+        load = os.getloadavg()
+        info["load_average"] = [round(x, 2) for x in load]
+    except (AttributeError, OSError):
+        if os.path.exists("/proc/loadavg"):
+            try:
+                with open("/proc/loadavg", "r", encoding="utf-8") as f:
+                    parts = f.read().strip().split()
+                    info["load_average"] = [round(float(parts[i]), 2) for i in range(3)]
+            except Exception:
+                pass
+
+    # /proc/cpuinfo for model & physical cores
+    if os.path.exists("/proc/cpuinfo"):
+        try:
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            core_ids = set()
+            physical_ids = set()
+            for line in lines:
+                if ":" in line:
+                    k, v = [x.strip() for x in line.split(":", 1)]
+                    if k in ("model name", "Hardware", "Processor") and info["model"] == "Unknown CPU":
+                        info["model"] = v
+                    elif k == "core id":
+                        core_ids.add(v)
+                    elif k == "physical id":
+                        physical_ids.add(v)
+            if physical_ids and core_ids:
+                info["cores_physical"] = len(physical_ids) * len(core_ids)
+            elif core_ids:
+                info["cores_physical"] = len(core_ids)
+        except Exception:
+            pass
+
+    if info["cores_physical"] is None:
+        info["cores_physical"] = info["cores_logical"]
+
+    # CPU governor
+    gov_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+    if os.path.exists(gov_path):
+        try:
+            with open(gov_path, "r", encoding="utf-8") as f:
+                info["governor"] = f.read().strip()
+        except Exception:
+            pass
+
+    # Thermal probe
+    temps: List[float] = []
+    # 1. /sys/class/thermal/thermal_zone*/temp
+    for tz in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
+            with open(tz, "r", encoding="utf-8") as f:
+                raw = float(f.read().strip())
+                if raw > 1000:
+                    raw /= 1000.0
+                if 0 < raw < 120:
+                    temps.append(raw)
+        except Exception:
+            continue
+
+    # 2. /sys/class/hwmon/hwmon*/temp*_input
+    if not temps:
+        for hw in glob.glob("/sys/class/hwmon/hwmon*/temp*_input"):
+            try:
+                with open(hw, "r", encoding="utf-8") as f:
+                    raw = float(f.read().strip())
+                    if raw > 1000:
+                        raw /= 1000.0
+                    if 0 < raw < 120:
+                        temps.append(raw)
+            except Exception:
+                continue
+
+    if temps:
+        info["temperature_c"] = round(max(temps), 1)
+
+    return info
+
+
+# ----------------------------------------------------------------------
+# 2. Memory & zRAM Diagnostics
+# ----------------------------------------------------------------------
+def get_memory_info() -> Dict[str, Any]:
+    """Inspect physical RAM and zRAM swap status."""
+    mem: Dict[str, Any] = {
+        "ram_total_mb": 0,
+        "ram_used_mb": 0,
+        "ram_free_mb": 0,
+        "ram_available_mb": 0,
+        "ram_used_percent": 0.0,
+        "swap_total_mb": 0,
+        "swap_free_mb": 0,
+        "zram": {
+            "active": False,
+            "device": None,
+            "algorithm": None,
+            "disksize_mb": 0,
+            "orig_data_mb": 0,
+            "compr_data_mb": 0,
+            "compression_ratio": 1.0,
+        },
+    }
+
+    # /proc/meminfo
+    if os.path.exists("/proc/meminfo"):
+        try:
+            mem_data: Dict[str, int] = {}
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        key = parts[0].strip()
+                        val_str = parts[1].strip().split()[0]
+                        if val_str.isdigit():
+                            mem_data[key] = int(val_str)
+
+            total_kb = mem_data.get("MemTotal", 0)
+            free_kb = mem_data.get("MemFree", 0)
+            avail_kb = mem_data.get("MemAvailable", free_kb)
+            used_kb = max(0, total_kb - avail_kb)
+
+            mem["ram_total_mb"] = total_kb // 1024
+            mem["ram_free_mb"] = free_kb // 1024
+            mem["ram_available_mb"] = avail_kb // 1024
+            mem["ram_used_mb"] = used_kb // 1024
+            if total_kb > 0:
+                mem["ram_used_percent"] = round((used_kb / total_kb) * 100, 1)
+
+            mem["swap_total_mb"] = mem_data.get("SwapTotal", 0) // 1024
+            mem["swap_free_mb"] = mem_data.get("SwapFree", 0) // 1024
+        except Exception:
+            pass
+
+    # zRAM detection
+    zram_dirs = glob.glob("/sys/block/zram*")
+    if zram_dirs:
+        zram_dir = sorted(zram_dirs)[0]
+        dev_name = os.path.basename(zram_dir)
+        zram_info = mem["zram"]
+        zram_info["device"] = dev_name
+
+        # Check /proc/swaps to see if active
+        if os.path.exists("/proc/swaps"):
+            try:
+                with open("/proc/swaps", "r", encoding="utf-8") as f:
+                    if dev_name in f.read():
+                        zram_info["active"] = True
+            except Exception:
+                pass
+
+        # Algorithm: /sys/block/zram0/comp_algorithm
+        algo_file = os.path.join(zram_dir, "comp_algorithm")
+        if os.path.exists(algo_file):
+            try:
+                with open(algo_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                    # e.g., "lzo [zstd] lz4"
+                    m = re.search(r"\[([a-zA-Z0-9_-]+)\]", content)
+                    if m:
+                        zram_info["algorithm"] = m.group(1)
+                    else:
+                        zram_info["algorithm"] = content.split()[0] if content else "unknown"
+            except Exception:
+                pass
+
+        # Disk size: /sys/block/zram0/disksize
+        disksize_file = os.path.join(zram_dir, "disksize")
+        if os.path.exists(disksize_file):
+            try:
+                with open(disksize_file, "r", encoding="utf-8") as f:
+                    raw_bytes = int(f.read().strip())
+                    zram_info["disksize_mb"] = raw_bytes // (1024 * 1024)
+                    if raw_bytes > 0:
+                        zram_info["active"] = True
+            except Exception:
+                pass
+
+        # mm_stat: orig_data_size compr_data_size mem_used_total ...
+        mm_stat_file = os.path.join(zram_dir, "mm_stat")
+        if os.path.exists(mm_stat_file):
+            try:
+                with open(mm_stat_file, "r", encoding="utf-8") as f:
+                    fields = f.read().strip().split()
+                    if len(fields) >= 2:
+                        orig_bytes = int(fields[0])
+                        compr_bytes = int(fields[1])
+                        zram_info["orig_data_mb"] = round(orig_bytes / (1024 * 1024), 2)
+                        zram_info["compr_data_mb"] = round(compr_bytes / (1024 * 1024), 2)
+                        if compr_bytes > 0:
+                            zram_info["compression_ratio"] = round(orig_bytes / compr_bytes, 2)
+            except Exception:
+                pass
+
+    return mem
+
+
+# ----------------------------------------------------------------------
+# 3. GPU & Hardware Acceleration
+# ----------------------------------------------------------------------
+def get_gpu_info(quick: bool = False) -> Dict[str, Any]:
+    """Inspect GPU vendor, drivers, and hardware acceleration (VA-API / Vulkan)."""
+    gpu: Dict[str, Any] = {
+        "devices": [],
+        "drivers": [],
+        "acceleration": {
+            "vulkan": False,
+            "vaapi": False,
+            "opengl": False,
+            "details": [],
+        },
+    }
+
+    # 1. Query lspci or /sys/bus/pci
+    if shutil.which("lspci"):
+        try:
+            res = subprocess.run(
+                ["lspci", "-nnk"],
+                capture_output=True,
+                text=True,
+                timeout=3 if quick else 5,
+                check=False,
+            )
+            current_device: Optional[str] = None
+            for line in res.stdout.splitlines():
+                if any(x in line for x in ("VGA compatible controller", "3D controller", "Display controller")):
+                    current_device = line.strip()
+                    gpu["devices"].append(current_device)
+                elif current_device and "Kernel driver in use:" in line:
+                    drv = line.split(":", 1)[1].strip()
+                    if drv not in gpu["drivers"]:
+                        gpu["drivers"].append(drv)
+                    current_device = None
+        except Exception:
+            pass
+
+    # Fallback to /sys/class/drm
+    if not gpu["devices"]:
+        cards = glob.glob("/sys/class/drm/card[0-9]")
+        for card in cards:
+            card_name = os.path.basename(card)
+            gpu["devices"].append(f"DRM Device ({card_name})")
+            device_driver = os.path.join(card, "device", "driver")
+            if os.path.exists(device_driver):
+                drv_name = os.path.basename(os.path.realpath(device_driver))
+                if drv_name not in gpu["drivers"]:
+                    gpu["drivers"].append(drv_name)
+
+    # 2. Check Vulkan support
+    vulkan_icd = glob.glob("/usr/share/vulkan/icd.d/*.json") + glob.glob("/etc/vulkan/icd.d/*.json")
+    vulkan_lib = glob.glob("/usr/lib/*/libvulkan.so*") or glob.glob("/lib/*/libvulkan.so*")
+    if vulkan_icd or vulkan_lib or shutil.which("vulkaninfo"):
+        gpu["acceleration"]["vulkan"] = True
+        gpu["acceleration"]["details"].append("Vulkan ICD/loader detected")
+
+    # 3. Check VA-API (Video Acceleration)
+    vaapi_drivers = glob.glob("/usr/lib/*/dri/*_drv_video.so") or glob.glob("/usr/lib64/dri/*_drv_video.so")
+    if vaapi_drivers or shutil.which("vainfo"):
+        gpu["acceleration"]["vaapi"] = True
+        gpu["acceleration"]["details"].append("VA-API video acceleration drivers present")
+
+    # 4. Check OpenGL / DRI
+    dri_drivers = glob.glob("/usr/lib/*/dri/*_dri.so")
+    if dri_drivers or shutil.which("glxinfo"):
+        gpu["acceleration"]["opengl"] = True
+        gpu["acceleration"]["details"].append("Mesa DRI OpenGL drivers present")
+
+    return gpu
+
+
+# ----------------------------------------------------------------------
+# 4. Power & Battery Diagnostics
+# ----------------------------------------------------------------------
+def get_power_info() -> Dict[str, Any]:
+    """Inspect battery charge, health, and AC power status via sysfs."""
+    power: Dict[str, Any] = {
+        "battery_present": False,
+        "battery_percent": None,
+        "battery_status": None,
+        "battery_health": None,
+        "ac_online": None,
+        "source": "Unknown",
+    }
+
+    supplies = glob.glob("/sys/class/power_supply/*")
+    for supply in supplies:
+        type_file = os.path.join(supply, "type")
+        sup_type = ""
+        if os.path.exists(type_file):
+            try:
+                with open(type_file, "r", encoding="utf-8") as f:
+                    sup_type = f.read().strip().lower()
+            except Exception:
+                pass
+
+        # AC / Mains adapter
+        if sup_type in ("mains", "ac", "usb"):
+            online_file = os.path.join(supply, "online")
+            if os.path.exists(online_file):
+                try:
+                    with open(online_file, "r", encoding="utf-8") as f:
+                        is_online = (f.read().strip() == "1")
+                        power["ac_online"] = is_online
+                        if is_online:
+                            power["source"] = "AC Power"
+                except Exception:
+                    pass
+
+        # Battery
+        if sup_type == "battery" or os.path.basename(supply).startswith("BAT"):
+            power["battery_present"] = True
+            # Capacity
+            cap_file = os.path.join(supply, "capacity")
+            if os.path.exists(cap_file):
+                try:
+                    with open(cap_file, "r", encoding="utf-8") as f:
+                        power["battery_percent"] = int(f.read().strip())
+                except Exception:
+                    pass
+
+            # Status (Charging, Discharging, Full, Not charging)
+            status_file = os.path.join(supply, "status")
+            if os.path.exists(status_file):
+                try:
+                    with open(status_file, "r", encoding="utf-8") as f:
+                        power["battery_status"] = f.read().strip()
+                except Exception:
+                    pass
+
+            # Health
+            health_file = os.path.join(supply, "health")
+            if os.path.exists(health_file):
+                try:
+                    with open(health_file, "r", encoding="utf-8") as f:
+                        power["battery_health"] = f.read().strip()
+                except Exception:
+                    pass
+
+    if not power["battery_present"]:
+        if power["ac_online"] is True or power["ac_online"] is None:
+            power["source"] = "AC Mains (Desktop/VM)"
+
+    return power
+
+
+# ----------------------------------------------------------------------
+# 5. Storage & Persistence Overlay Diagnostics
+# ----------------------------------------------------------------------
+def get_storage_info() -> Dict[str, Any]:
+    """Inspect mounted filesystems, live persistence health, and write-wear optimizations."""
+    storage: Dict[str, Any] = {
+        "root_usage": {
+            "total_gb": 0.0,
+            "used_gb": 0.0,
+            "free_gb": 0.0,
+            "percent": 0.0,
+        },
+        "persistence": {
+            "active": False,
+            "type": "none",
+            "mountpoint": None,
+            "backing_store": None,
+        },
+        "write_wear_optimizations": {
+            "noatime": False,
+            "commit_60": False,
+            "tmpfs_tmp": False,
+            "journal_volatile": False,
+        },
+        "mounts": [],
+    }
+
+    # Disk usage for root
+    try:
+        total, used, free = shutil.disk_usage("/")
+        storage["root_usage"]["total_gb"] = round(total / (1024**3), 2)
+        storage["root_usage"]["used_gb"] = round(used / (1024**3), 2)
+        storage["root_usage"]["free_gb"] = round(free / (1024**3), 2)
+        if total > 0:
+            storage["root_usage"]["percent"] = round((used / total) * 100, 1)
+    except Exception:
+        pass
+
+    # Inspect /proc/mounts
+    root_options: List[str] = []
+    if os.path.exists("/proc/mounts"):
+        try:
+            with open("/proc/mounts", "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 4:
+                        dev, mp, fstype, opts = parts[0], parts[1], parts[2], parts[3]
+                        opts_list = opts.split(",")
+                        if mp in ("/", "/tmp", "/home", "/var/lib/agentic") or "persistence" in mp or "live" in mp:
+                            storage["mounts"].append({
+                                "device": dev,
+                                "mountpoint": mp,
+                                "fstype": fstype,
+                                "options": opts,
+                            })
+
+                        if mp == "/":
+                            root_options = opts_list
+                            if fstype == "overlay":
+                                storage["persistence"]["type"] = "overlay"
+                                # check for persistence upperdir
+                                for opt in opts_list:
+                                    if opt.startswith("upperdir="):
+                                        storage["persistence"]["backing_store"] = opt.split("=", 1)[1]
+                                        if any(k in opt for k in ("persistence", "live-rw", "persist")):
+                                            storage["persistence"]["active"] = True
+
+                        if mp == "/tmp" and fstype == "tmpfs":
+                            storage["write_wear_optimizations"]["tmpfs_tmp"] = True
+
+                        if "persistence" in mp or "live" in mp:
+                            storage["persistence"]["active"] = True
+                            storage["persistence"]["mountpoint"] = mp
+        except Exception:
+            pass
+
+    # Check write-wear optimizations on root or key mounts
+    for opt in root_options:
+        if opt == "noatime":
+            storage["write_wear_optimizations"]["noatime"] = True
+        elif opt.startswith("commit="):
+            try:
+                commit_val = int(opt.split("=", 1)[1])
+                if commit_val >= 60:
+                    storage["write_wear_optimizations"]["commit_60"] = True
+            except ValueError:
+                pass
+
+    # Check journald volatile configuration
+    journal_conf_files = ["/etc/systemd/journald.conf"] + glob.glob("/etc/systemd/journald.conf.d/*.conf")
+    for jc in journal_conf_files:
+        if os.path.exists(jc):
+            try:
+                with open(jc, "r", encoding="utf-8") as f:
+                    if re.search(r"^\s*Storage\s*=\s*volatile", f.read(), re.MULTILINE):
+                        storage["write_wear_optimizations"]["journal_volatile"] = True
+                        break
+            except Exception:
+                pass
+
+    return storage
+
+
+# ----------------------------------------------------------------------
+# 6. Agentic Environment Diagnostics
+# ----------------------------------------------------------------------
+def get_agentic_info(quick: bool = False) -> Dict[str, Any]:
+    """Inspect Agentic IPC socket, Ghost Workspace daemon, Ollama, and Pi agent."""
+    uid = os.getuid()
+    agentic: Dict[str, Any] = {
+        "ipc_socket": {
+            "path": None,
+            "active": False,
+        },
+        "ghost_workspace": {
+            "running": False,
+            "daemon_bin": shutil.which("ghost-workspace-helper") or "/usr/local/bin/ghost-workspace-helper",
+        },
+        "ollama": {
+            "running": False,
+            "reachable": False,
+            "port": 11434,
+        },
+        "pi_agent": {
+            "installed": False,
+            "binary": shutil.which("pi") or "/usr/local/bin/pi",
+            "version": None,
+            "skills_dir": "/etc/pi/skills",
+            "skills_count": 0,
+        },
+    }
+
+    # Check IPC socket candidates
+    env_sock = os.environ.get("AGENTIC_SOCKET_PATH")
+    candidates = []
+    if env_sock:
+        candidates.append(env_sock)
+    candidates.extend([
+        f"/run/user/{uid}/agentic.sock",
+        f"/tmp/agentic-{uid}.sock",
+        f"/run/user/{uid}/computer-use-gateway.sock",
+        f"/tmp/computer-use-gateway-{uid}.sock",
+    ])
+    for cand in candidates:
+        if os.path.exists(cand):
+            agentic["ipc_socket"]["path"] = cand
+            try:
+                st = os.stat(cand)
+                if stat.S_ISSOCK(st.st_mode):
+                    agentic["ipc_socket"]["active"] = True
+                    break
+            except OSError:
+                pass
+
+    if agentic["ipc_socket"]["path"] is None:
+        agentic["ipc_socket"]["path"] = candidates[0]
+
+    # Check Ghost Workspace helper process
+    try:
+        for p in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                with open(p, "rb") as f:
+                    cmdline = f.read().decode("utf-8", errors="ignore").replace("\x00", " ")
+                    if "ghost-workspace-helper" in cmdline:
+                        agentic["ghost_workspace"]["running"] = True
+                        break
+            except (OSError, IOError):
+                continue
+    except Exception:
+        pass
+
+    # Check Ollama service / port
+    try:
+        # Check process
+        for p in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                with open(p, "rb") as f:
+                    cmdline = f.read().decode("utf-8", errors="ignore").replace("\x00", " ")
+                    if "ollama" in cmdline and not "pi-doctor" in cmdline:
+                        agentic["ollama"]["running"] = True
+                        break
+            except (OSError, IOError):
+                continue
+    except Exception:
+        pass
+
+    # Check Ollama reachable (TCP socket ping, fast 0.5s timeout)
+    if not quick:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            result = s.connect_ex(("127.0.0.1", 11434))
+            s.close()
+            if result == 0:
+                agentic["ollama"]["reachable"] = True
+                agentic["ollama"]["running"] = True
+        except Exception:
+            pass
+
+    # Check Pi Agent
+    pi_bin = agentic["pi_agent"]["binary"]
+    if pi_bin and os.path.exists(pi_bin) and os.access(pi_bin, os.X_OK):
+        agentic["pi_agent"]["installed"] = True
+        if not quick:
+            try:
+                res = subprocess.run(
+                    [pi_bin, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+                ver = res.stdout.strip() or res.stderr.strip()
+                if ver and len(ver) < 64:
+                    agentic["pi_agent"]["version"] = ver
+            except Exception:
+                pass
+
+    # Count skills in /etc/pi/skills
+    skills_dir = agentic["pi_agent"]["skills_dir"]
+    if os.path.isdir(skills_dir):
+        try:
+            entries = [
+                d for d in os.listdir(skills_dir)
+                if os.path.isdir(os.path.join(skills_dir, d)) or d.endswith((".md", ".json", ".ts", ".js"))
+            ]
+            agentic["pi_agent"]["skills_count"] = len(entries)
+        except Exception:
+            pass
+
+    return agentic
+
+
+def get_uptime_seconds() -> int:
+    """Retrieve system uptime in seconds from /proc/uptime."""
+    if os.path.exists("/proc/uptime"):
+        try:
+            with open("/proc/uptime", "r", encoding="utf-8") as f:
+                return int(float(f.read().split()[0]))
+        except Exception:
+            pass
+    return 0
+
+
+# ----------------------------------------------------------------------
+# 7. Aggregator & Formatter
+# ----------------------------------------------------------------------
+def collect_all_diagnostics(quick: bool = False) -> Dict[str, Any]:
+    """Collect all diagnostic domains into a structured dictionary."""
+    return {
+        "version": VERSION,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "quick_mode": quick,
+        "system": {
+            "platform": sys.platform,
+            "arch": platform.machine(),
+            "hostname": platform.node(),
+            "kernel": platform.release(),
+            "uptime_seconds": get_uptime_seconds(),
+        },
+        "cpu": get_cpu_info(quick=quick),
+        "memory": get_memory_info(),
+        "gpu": get_gpu_info(quick=quick),
+        "power": get_power_info(),
+        "storage": get_storage_info(),
+        "agentic": get_agentic_info(quick=quick),
+    }
+
+
+def format_human_report(diag: Dict[str, Any]) -> str:
+    """Format diagnostic data into an elegant, readable terminal report."""
+    lines: List[str] = []
+    prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "aeth-doctor"
+    lines.append("=" * 68)
+    lines.append(f"  Aeth OS System Doctor ({prog} v{diag['version']})")
+    lines.append("=" * 68)
+
+    # 1. CPU
+    cpu = diag["cpu"]
+    temp_str = f"{cpu['temperature_c']} °C" if cpu.get("temperature_c") is not None else "N/A"
+    lines.append("\n[CPU & Processing]")
+    lines.append(f"  Model:        {cpu.get('model', 'Unknown')} ({cpu.get('arch')})")
+    lines.append(f"  Cores:        {cpu.get('cores_logical')} logical ({cpu.get('cores_physical')} physical)")
+    lines.append(f"  Load Avg:     {cpu.get('load_average', [0,0,0])} (1m, 5m, 15m)")
+    lines.append(f"  Temperature:  {temp_str}")
+    if cpu.get("governor"):
+        lines.append(f"  Governor:     {cpu.get('governor')}")
+
+    # 2. Memory & zRAM
+    mem = diag["memory"]
+    zram = mem["zram"]
+    zram_status = "Active" if zram.get("active") else "Inactive"
+    lines.append("\n[Memory & Swap / zRAM]")
+    lines.append(
+        f"  Physical RAM: {mem.get('ram_used_mb', 0)} MB / {mem.get('ram_total_mb', 0)} MB "
+        f"({mem.get('ram_used_percent', 0.0)}% used, {mem.get('ram_available_mb', 0)} MB available)"
+    )
+    lines.append(f"  Total Swap:   {mem.get('swap_total_mb', 0)} MB ({mem.get('swap_free_mb', 0)} MB free)")
+    lines.append(f"  zRAM Status:  {zram_status} (device: {zram.get('device') or 'none'})")
+    if zram.get("active"):
+        lines.append(f"    Algorithm:  {zram.get('algorithm') or 'unknown'}")
+        lines.append(f"    Disk Size:  {zram.get('disksize_mb', 0)} MB")
+        lines.append(
+            f"    Data Ratio: {zram.get('orig_data_mb', 0)} MB -> {zram.get('compr_data_mb', 0)} MB "
+            f"({zram.get('compression_ratio', 1.0)}x compression)"
+        )
+
+    # 3. GPU & Acceleration
+    gpu = diag["gpu"]
+    lines.append("\n[GPU & Video Acceleration]")
+    devs = gpu.get("devices", [])
+    if devs:
+        for d in devs:
+            lines.append(f"  Device:       {d}")
+    else:
+        lines.append("  Device:       Generic DRM / Display Controller")
+    drivers = gpu.get("drivers", [])
+    lines.append(f"  Kernel Driver:{', '.join(drivers) if drivers else 'None / Standard Framebuffer'}")
+    acc = gpu.get("acceleration", {})
+    acc_list = []
+    if acc.get("vulkan"):
+        acc_list.append("Vulkan")
+    if acc.get("vaapi"):
+        acc_list.append("VA-API")
+    if acc.get("opengl"):
+        acc_list.append("OpenGL/DRI")
+    lines.append(f"  Acceleration: {', '.join(acc_list) if acc_list else 'Software Rasterizer'}")
+
+    # 4. Power & Battery
+    pwr = diag["power"]
+    lines.append("\n[Power & Battery]")
+    if pwr.get("battery_present"):
+        status = pwr.get("battery_status") or "Unknown"
+        pct = f"{pwr.get('battery_percent')}%" if pwr.get("battery_percent") is not None else "N/A"
+        lines.append(f"  Battery:      {pct} ({status})")
+    else:
+        lines.append(f"  Power Source: {pwr.get('source', 'AC Mains')}")
+    if pwr.get("ac_online") is not None:
+        lines.append(f"  AC Adapter:   {'Connected' if pwr['ac_online'] else 'Disconnected'}")
+
+    # 5. Storage & Persistence
+    stg = diag["storage"]
+    root = stg.get("root_usage", {})
+    persist = stg.get("persistence", {})
+    opt = stg.get("write_wear_optimizations", {})
+    lines.append("\n[Storage & Persistence Health]")
+    lines.append(
+        f"  Root Storage: {root.get('used_gb', 0)} GB / {root.get('total_gb', 0)} GB "
+        f"({root.get('percent', 0.0)}% used, {root.get('free_gb', 0)} GB free)"
+    )
+    p_stat = "Active" if persist.get("active") else "Disabled (Standard Read-Only / Ephemeral)"
+    lines.append(f"  Persistence:  {p_stat}")
+    if persist.get("backing_store"):
+        lines.append(f"    Backing:    {persist.get('backing_store')}")
+    lines.append("  Write-Wear Optimizations:")
+    lines.append(f"    - noatime mount:         {'[OK] Enabled' if opt.get('noatime') else '[--] Disabled'}")
+    lines.append(f"    - 60s commit interval:   {'[OK] Enabled' if opt.get('commit_60') else '[--] Default'}")
+    lines.append(f"    - tmpfs on /tmp:         {'[OK] Active' if opt.get('tmpfs_tmp') else '[--] Disk-backed'}")
+    lines.append(f"    - Volatile journald:     {'[OK] Active' if opt.get('journal_volatile') else '[--] Persistent'}")
+
+    # 6. Agentic Environment
+    agn = diag["agentic"]
+    sock = agn.get("ipc_socket", {})
+    gw = agn.get("ghost_workspace", {})
+    ollama = agn.get("ollama", {})
+    pi = agn.get("pi_agent", {})
+
+    lines.append("\n[Agentic Environment & Runtime]")
+    sock_stat = "[Active]" if sock.get("active") else "[Inactive]"
+    lines.append(f"  IPC Socket:   {sock.get('path')} {sock_stat}")
+    lines.append(f"  Ghost Daemon: {'[Active]' if gw.get('running') else '[Idle / Standby]'}")
+    ollama_stat = "[Active]" if (ollama.get("running") or ollama.get("reachable")) else "[Offline]"
+    lines.append(f"  Ollama:       {ollama_stat} (port {ollama.get('port', 11434)})")
+    pi_stat = "[Installed]" if pi.get("installed") else "[Not Installed]"
+    lines.append(f"  Pi Agent:     {pi_stat} ({pi.get('skills_count', 0)} skills in {pi.get('skills_dir')})")
+
+    lines.append("\n" + "=" * 68)
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# 8. Main Entrypoint
+# ----------------------------------------------------------------------
+def main() -> int:
+    current_prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "aeth-doctor"
+    parser = argparse.ArgumentParser(
+        prog=current_prog,
+        description="Aeth OS System Health, Hardware Diagnostics & Agentic Runtime Inspector.",
+    )
+    parser.add_argument(
+        "--version",
+        "-v",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw diagnostics in JSON format for automated tooling and agents.",
+    )
+    parser.add_argument(
+        "--quick",
+        "-q",
+        action="store_true",
+        help="Perform fast probe without querying external hardware commands or network services.",
+    )
+
+    args = parser.parse_args()
+
+    diagnostics = collect_all_diagnostics(quick=args.quick)
+
+    if args.json:
+        print(json.dumps(diagnostics, indent=2, ensure_ascii=False))
+    else:
+        print(format_human_report(diagnostics))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

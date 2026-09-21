@@ -21,6 +21,8 @@ from unittest.mock import MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOK_SCRIPT = REPO_ROOT / "config" / "hooks" / "live" / "0099-setup-agentic-user.hook.chroot"
+AETH_DOCTOR = REPO_ROOT / "config" / "includes.chroot" / "usr" / "local" / "bin" / "aeth-doctor"
+AETH_NET = REPO_ROOT / "config" / "includes.chroot" / "usr" / "local" / "bin" / "aeth-net"
 PI_DOCTOR = REPO_ROOT / "config" / "includes.chroot" / "usr" / "local" / "bin" / "pi-doctor"
 PI_NET = REPO_ROOT / "config" / "includes.chroot" / "usr" / "local" / "bin" / "pi-net"
 
@@ -55,12 +57,16 @@ class TestSystemToolsPermissionsAndSyntax(unittest.TestCase):
         self.assertTrue(os.access(HOOK_SCRIPT, os.X_OK), "Hook script must be executable (chmod +x)")
 
     def test_pi_doctor_exists_and_executable(self):
-        self.assertTrue(PI_DOCTOR.is_file(), f"Missing pi-doctor script: {PI_DOCTOR}")
-        self.assertTrue(os.access(PI_DOCTOR, os.X_OK), "pi-doctor must be executable (chmod +x)")
+        self.assertTrue(AETH_DOCTOR.is_file(), f"Missing aeth-doctor script: {AETH_DOCTOR}")
+        self.assertTrue(os.access(AETH_DOCTOR, os.X_OK), "aeth-doctor must be executable (chmod +x)")
+        self.assertTrue(PI_DOCTOR.is_symlink() or PI_DOCTOR.is_file(), "pi-doctor alias must exist")
+        self.assertTrue(os.access(PI_DOCTOR, os.X_OK), "pi-doctor alias must be executable")
 
     def test_pi_net_exists_and_executable(self):
-        self.assertTrue(PI_NET.is_file(), f"Missing pi-net script: {PI_NET}")
-        self.assertTrue(os.access(PI_NET, os.X_OK), "pi-net must be executable (chmod +x)")
+        self.assertTrue(AETH_NET.is_file(), f"Missing aeth-net script: {AETH_NET}")
+        self.assertTrue(os.access(AETH_NET, os.X_OK), "aeth-net must be executable (chmod +x)")
+        self.assertTrue(PI_NET.is_symlink() or PI_NET.is_file(), "pi-net alias must exist")
+        self.assertTrue(os.access(PI_NET, os.X_OK), "pi-net alias must be executable")
 
     def test_bash_syntax_hook_script(self):
         res = subprocess.run(["bash", "-n", str(HOOK_SCRIPT)], capture_output=True, text=True)
@@ -144,13 +150,18 @@ class TestPiDoctorCLI(unittest.TestCase):
     """Test pi-doctor CLI arguments, human report, and JSON schema."""
 
     def test_help_and_version(self):
-        res_help = subprocess.run([str(PI_DOCTOR), "--help"], capture_output=True, text=True)
+        res_help = subprocess.run([str(AETH_DOCTOR), "--help"], capture_output=True, text=True)
         self.assertEqual(res_help.returncode, 0)
-        self.assertIn("AgenticOS System Health", res_help.stdout)
+        self.assertIn("Aeth OS System Health", res_help.stdout)
 
-        res_ver = subprocess.run([str(PI_DOCTOR), "--version"], capture_output=True, text=True)
+        res_ver = subprocess.run([str(AETH_DOCTOR), "--version"], capture_output=True, text=True)
         self.assertEqual(res_ver.returncode, 0)
-        self.assertIn("pi-doctor 1.0.0", res_ver.stdout)
+        self.assertIn("1.0.0", res_ver.stdout)
+
+        # Also verify legacy pi-doctor alias invokes cleanly
+        res_alias = subprocess.run([str(PI_DOCTOR), "--version"], capture_output=True, text=True)
+        self.assertEqual(res_alias.returncode, 0)
+        self.assertIn("1.0.0", res_alias.stdout)
 
     def test_human_report_sections(self):
         res = subprocess.run([str(PI_DOCTOR), "--quick"], capture_output=True, text=True)
@@ -307,19 +318,24 @@ class TestPiNetCLI(unittest.TestCase):
     """Test pi-net CLI flags, subcommands, output formatting, and mock nmcli interactions."""
 
     def test_help_and_version(self):
-        res_help = subprocess.run([str(PI_NET), "--help"], capture_output=True, text=True)
+        res_help = subprocess.run([str(AETH_NET), "--help"], capture_output=True, text=True)
         self.assertEqual(res_help.returncode, 0)
         self.assertIn("WiFi & Networking CLI", res_help.stdout)
 
-        res_ver = subprocess.run([str(PI_NET), "--version"], capture_output=True, text=True)
+        res_ver = subprocess.run([str(AETH_NET), "--version"], capture_output=True, text=True)
         self.assertEqual(res_ver.returncode, 0)
-        self.assertIn("pi-net 1.0.0", res_ver.stdout)
+        self.assertIn("1.0.0", res_ver.stdout)
+
+        # Also verify legacy pi-net alias invokes cleanly
+        res_alias = subprocess.run([str(PI_NET), "--version"], capture_output=True, text=True)
+        self.assertEqual(res_alias.returncode, 0)
+        self.assertIn("1.0.0", res_alias.stdout)
 
     def test_status_text_and_json(self):
         # Text status
-        res = subprocess.run([str(PI_NET), "status"], capture_output=True, text=True)
+        res = subprocess.run([str(AETH_NET), "status"], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0)
-        self.assertIn("AgenticOS Network Status", res.stdout)
+        self.assertIn("Network Status", res.stdout)
         self.assertIn("[Network Interfaces]", res.stdout)
 
         # JSON status
