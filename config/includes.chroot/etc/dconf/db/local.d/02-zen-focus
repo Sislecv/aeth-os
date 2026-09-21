@@ -1,0 +1,30 @@
+# ==============================================================================
+# AgenticOS: Zen Focus Mode & Window Focus Configuration
+# ==============================================================================
+
+# Custom Keybinding for Zen Focus Mode (Super+F11)
+[org/gnome/settings-daemon/plugins/media-keys]
+custom-keybindings=['/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/']
+
+[org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0]
+binding='<Super>F11'
+command='/usr/local/bin/agentic-zen-toggle'
+name='Zen Focus Mode'
+
+# Focus Preferences
+[org/gnome/desktop/wm/preferences]
+focus-mode='click'
+auto-raise=false
+focus-new-windows='smart'
+
+# Mutter Window Focus and Tiling Management
+[org/gnome/mutter]
+center-new-windows=true
+attach-modal-dialogs=true
+edge-tiling=true
+dynamic-workspaces=true
+workspaces-only-on-primary=true
+
+# Notification Banners Default State (Toggled by Zen Mode)
+[org/gnome/desktop/notifications]
+show-banners=true

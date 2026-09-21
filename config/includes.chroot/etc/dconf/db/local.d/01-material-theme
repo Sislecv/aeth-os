@@ -1,0 +1,16 @@
+# ==============================================================================
+# AgenticOS: Material Design 3 Theming & Typography Configuration
+# ==============================================================================
+
+[org/gnome/desktop/interface]
+color-scheme='prefer-dark'
+gtk-theme='Adwaita-dark'
+icon-theme='Papirus-Dark'
+font-name='Roboto 11'
+document-font-name='Roboto 11'
+monospace-font-name='FiraCode Nerd Font 10'
+toolkit-accessibility=true
+enable-animations=true
+
+[org/gnome/desktop/wm/preferences]
+titlebar-font='Roboto Bold 11'

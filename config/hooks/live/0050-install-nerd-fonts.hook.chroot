@@ -1,0 +1,101 @@
+#!/bin/bash
+# ==============================================================================
+# AgenticOS: 0050-install-nerd-fonts.hook.chroot
+#
+# Installs complete FiraCode and JetBrainsMono Nerd Fonts (with Devicons and
+# Powerline glyphs) into /usr/share/fonts/truetype/nerd-fonts, rebuilds font
+# cache, and compiles system dconf database.
+# ==============================================================================
+set -euo pipefail
+
+echo "===================================================================="
+echo "==> [Hook] Installing Nerd Fonts and updating dconf database..."
+echo "===================================================================="
+
+TARGET_DIR="/usr/share/fonts/truetype/nerd-fonts"
+NERD_FONTS_VERSION="v3.2.1"
+BASE_URL="https://github.com/ryanoasis/nerd-fonts/releases/download/${NERD_FONTS_VERSION}"
+TMP_DIR="$(mktemp -d /tmp/nerd-fonts-XXXXXX)"
+
+cleanup() {
+    rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT
+
+mkdir -p "${TARGET_DIR}"
+
+install_font() {
+    local font_name="$1"
+    local tar_name="${font_name}.tar.xz"
+    local zip_name="${font_name}.zip"
+    local tar_url="${BASE_URL}/${tar_name}"
+    local zip_url="${BASE_URL}/${zip_name}"
+    local downloaded=0
+
+    echo "==> Fetching ${font_name} Nerd Font (${NERD_FONTS_VERSION})..."
+
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --connect-timeout 15 --max-time 180 --retry 3 "${tar_url}" -o "${TMP_DIR}/${tar_name}" 2>/dev/null; then
+            echo "==> Extracting ${tar_name} into ${TARGET_DIR}..."
+            tar -xf "${TMP_DIR}/${tar_name}" -C "${TARGET_DIR}" --wildcards '*.ttf' '*.otf' 2>/dev/null \
+                || tar -xf "${TMP_DIR}/${tar_name}" -C "${TARGET_DIR}" 2>/dev/null || true
+            downloaded=1
+        elif curl -fsSL --connect-timeout 15 --max-time 180 --retry 3 "${zip_url}" -o "${TMP_DIR}/${zip_name}" 2>/dev/null; then
+            echo "==> Extracting ${zip_name} into ${TARGET_DIR}..."
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -qo "${TMP_DIR}/${zip_name}" '*.ttf' '*.otf' -d "${TARGET_DIR}" 2>/dev/null \
+                    || unzip -qo "${TMP_DIR}/${zip_name}" -d "${TARGET_DIR}" 2>/dev/null || true
+                downloaded=1
+            fi
+        fi
+    fi
+
+    if [ "${downloaded}" -eq 1 ]; then
+        echo "==> Successfully installed ${font_name} Nerd Font."
+    else
+        echo "==> Warning: Unable to download ${font_name} from GitHub release."
+        echo "==> Attempting fallback to system-packaged fonts..."
+        case "${font_name}" in
+            FiraCode)
+                if [ -d "/usr/share/fonts/truetype/firacode" ]; then
+                    echo "==> Copying system FiraCode fonts as fallback..."
+                    cp -an /usr/share/fonts/truetype/firacode/*.ttf "${TARGET_DIR}/" 2>/dev/null || true
+                fi
+                ;;
+            JetBrainsMono)
+                if [ -d "/usr/share/fonts/truetype/jetbrains-mono" ]; then
+                    echo "==> Copying system JetBrainsMono fonts as fallback..."
+                    cp -an /usr/share/fonts/truetype/jetbrains-mono/*.ttf "${TARGET_DIR}/" 2>/dev/null || true
+                fi
+                ;;
+        esac
+    fi
+}
+
+# 1. Install FiraCode Nerd Font (default monospace font for coding & Zellij)
+install_font "FiraCode"
+
+# 2. Install JetBrainsMono Nerd Font (alternative developer monospace font)
+install_font "JetBrainsMono"
+
+# Ensure standard read permissions for all users
+chmod 644 "${TARGET_DIR}"/* 2>/dev/null || true
+
+# 3. Refresh system font cache
+echo "==> Updating font cache for ${TARGET_DIR}..."
+if command -v fc-cache >/dev/null 2>&1; then
+    fc-cache -fv "${TARGET_DIR}"
+else
+    echo "==> Notice: fc-cache command not available; skipping font cache generation."
+fi
+
+# 4. Compile system dconf database
+echo "==> Compiling dconf database (/etc/dconf/db/local)..."
+if [ -d "/etc/dconf/db" ] && command -v dconf >/dev/null 2>&1; then
+    dconf update
+    echo "==> dconf database compiled successfully."
+else
+    echo "==> Notice: /etc/dconf/db directory or dconf binary not present; skipping dconf update."
+fi
+
+echo "==> [Hook] 0050-install-nerd-fonts completed successfully."

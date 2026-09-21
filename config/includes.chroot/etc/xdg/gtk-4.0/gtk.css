@@ -1,0 +1,17 @@
+/* ==============================================================================
+ * AgenticOS: Material Design 3 Inactive Window Dimming & Easing Curves
+ * ============================================================================== */
+
+/* Smooth 200ms Standard Decelerate transitions for window state changes */
+window {
+    transition: opacity 200ms cubic-bezier(0.0, 0.0, 0.2, 1),
+                filter 200ms cubic-bezier(0.0, 0.0, 0.2, 1);
+}
+
+/* Inactive window dimming: ~15% opacity reduction and subtle contrast dampening */
+window:backdrop {
+    opacity: 0.85;
+    filter: brightness(0.85);
+    transition: opacity 200ms cubic-bezier(0.0, 0.0, 0.2, 1),
+                filter 200ms cubic-bezier(0.0, 0.0, 0.2, 1);
+}
