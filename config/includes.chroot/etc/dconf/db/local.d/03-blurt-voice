@@ -1,0 +1,29 @@
+# ==============================================================================
+# AgenticOS: Blurt Voice Integration & Keybindings Configuration
+# ==============================================================================
+
+# Custom Keybindings for Voice Agent:
+# - F5: Voice dictation directly to cursor / active window
+# - <Super>F5: Voice prompt directly to companion Pi Agent
+[org/gnome/settings-daemon/plugins/media-keys]
+custom-keybindings=['/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/', '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/', '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom2/']
+
+[org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1]
+binding='F5'
+command='/usr/local/bin/agentic-voice-agent --cursor'
+name='Voice Dictation to Cursor'
+
+[org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom2]
+binding='<Super>F5'
+command='/usr/local/bin/agentic-voice-agent --agent'
+name='Voice Prompt to Pi Agent'
+
+# Blurt GNOME Shell Extension configuration
+# VAD silence duration 1.0s, auto paste enabled, default model path
+[org/gnome/shell/extensions/blurt]
+vad-silence-timeout=1.0
+auto-paste=true
+recording-hotkey='F5'
+model-path='/usr/share/agentic/models/whisper/ggml-base.bin'
+language='auto'
+feedback-sound=true
