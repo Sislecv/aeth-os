@@ -1,0 +1,281 @@
+#!/bin/bash
+# ==============================================================================
+# AgenticOS: 0070-install-pi-agent.hook.chroot
+#
+# Installs @earendil-works/pi-coding-agent globally via npm and prepares
+# the system-wide Pi skills directory and user config templates.
+# Provides offline fallback to ensure non-blocking live-build chroot execution.
+# ==============================================================================
+set -euo pipefail
+
+echo "===================================================================="
+echo "==> [Hook] Installing Pi Coding Agent (@earendil-works/pi-coding-agent)..."
+echo "===================================================================="
+
+# Check if npm is available
+if ! command -v npm >/dev/null 2>&1; then
+    echo "==> Warning: npm is not available in chroot PATH."
+    echo "==> Verifying if nodejs / npm is installed in standard locations..."
+    if [ -x "/usr/bin/npm" ]; then
+        export PATH="/usr/bin:/usr/local/bin:${PATH}"
+    fi
+fi
+
+# Function to check online connectivity to npm registry
+check_internet() {
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --connect-timeout 5 --max-time 15 "https://registry.npmjs.org/" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        if wget -q --spider --timeout=5 --tries=1 "https://registry.npmjs.org/" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    if command -v npm >/dev/null 2>&1; then
+        if npm ping --timeout=5000 >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Function to setup offline bootstrap wrapper if npm install is skipped or fails
+setup_offline_fallback() {
+    local target_bin="/usr/local/bin/pi"
+    if [ -x "${target_bin}" ] && ! grep -q "AgenticOS: pi offline bootstrap fallback" "${target_bin}" 2>/dev/null; then
+        echo "==> Existing pi binary found at ${target_bin}, keeping existing installation."
+        return 0
+    fi
+
+    echo "==> Creating offline bootstrap fallback at ${target_bin}..."
+    mkdir -p "/usr/local/bin"
+    cat << 'EOF' > "${target_bin}"
+#!/usr/bin/env bash
+# AgenticOS: pi offline bootstrap fallback
+set -eo pipefail
+
+export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-${HOME}/.config/pi}"
+
+# Check if real pi binary was installed elsewhere
+REAL_PI=""
+for p in /usr/bin/pi /usr/local/share/npm/bin/pi /usr/local/lib/node_modules/.bin/pi; do
+    if [ -x "$p" ] && [ "$p" != "/usr/local/bin/pi" ]; then
+        REAL_PI="$p"
+        break
+    fi
+done
+
+if [ -n "$REAL_PI" ]; then
+    exec "$REAL_PI" "$@"
+fi
+
+if command -v npm >/dev/null 2>&1; then
+    echo "[pi-agent-bootstrap] Checking network connectivity..." >&2
+    if curl -fsSL --connect-timeout 3 "https://registry.npmjs.org/" >/dev/null 2>&1; then
+        echo "[pi-agent-bootstrap] Network available. Installing @earendil-works/pi-coding-agent..." >&2
+        npm install -g @earendil-works/pi-coding-agent >&2 || true
+        for p in /usr/local/bin/pi /usr/bin/pi /usr/local/share/npm/bin/pi; do
+            if [ -x "$p" ] && ! grep -q "AgenticOS: pi offline bootstrap fallback" "$p" 2>/dev/null; then
+                exec "$p" "$@"
+            fi
+        done
+    fi
+fi
+
+echo "[pi-agent] Notice: Pi Agent (@earendil-works/pi-coding-agent) is not yet installed." >&2
+echo "[pi-agent] To install, connect to the internet and run:" >&2
+echo "    sudo npm install -g @earendil-works/pi-coding-agent" >&2
+echo "" >&2
+echo "[pi-agent] Launching fallback interactive bash session..." >&2
+exec "${SHELL:-bash}"
+EOF
+    chmod 755 "${target_bin}"
+    echo "==> Offline bootstrap wrapper installed at ${target_bin}."
+}
+
+# 1. Attempt installation if npm is present
+if command -v npm >/dev/null 2>&1; then
+    if check_internet; then
+        echo "==> Internet connection detected. Running 'npm install -g @earendil-works/pi-coding-agent'..."
+        if npm install -g @earendil-works/pi-coding-agent; then
+            echo "==> @earendil-works/pi-coding-agent successfully installed via npm."
+        else
+            echo "==> Warning: npm install -g @earendil-works/pi-coding-agent failed. Initializing offline fallback."
+            setup_offline_fallback
+        fi
+    else
+        echo "==> Warning: Network connection unavailable during chroot hook execution."
+        echo "==> Setting up offline fallback to prevent live-build interruption..."
+        setup_offline_fallback
+    fi
+else
+    echo "==> Warning: npm command not found. Setting up offline fallback..."
+    setup_offline_fallback
+fi
+
+# 2. Prepares /etc/pi/skills/ directory with proper permissions (0755)
+echo "==> Preparing /etc/pi/skills/ directory..."
+mkdir -p /etc/pi/skills
+chmod 0755 /etc/pi/skills
+
+# 3. Setup /etc/skel/.config/pi/ directory and configuration template config.json
+echo "==> Configuring /etc/skel/.config/pi/..."
+mkdir -p /etc/skel/.config/pi
+
+if [ ! -f /etc/skel/.config/pi/config.json ]; then
+    cat << 'EOF' > /etc/skel/.config/pi/config.json
+{
+  "$schema": "https://pi.dev/schema/config.json",
+  "description": "AgenticOS Pi Agent direct user model & system configuration",
+  "defaultProvider": "ollama",
+  "defaultModel": "qwen2.5-coder:7b",
+  "defaultThinkingLevel": "low",
+  "providers": {
+    "ollama": {
+      "name": "Ollama (Local / Offline)",
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [
+        {
+          "id": "qwen2.5-coder:7b",
+          "displayName": "Qwen 2.5 Coder 7B (Default Local)"
+        },
+        {
+          "id": "deepseek-r1:8b",
+          "displayName": "DeepSeek R1 8B (Reasoning)"
+        },
+        {
+          "id": "llama3.1:8b",
+          "displayName": "Llama 3.1 8B"
+        }
+      ]
+    },
+    "deepseek": {
+      "name": "DeepSeek API",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "api": "openai-completions",
+      "apiKey": "${DEEPSEEK_API_KEY}",
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "displayName": "DeepSeek V3"
+        },
+        {
+          "id": "deepseek-reasoner",
+          "displayName": "DeepSeek R1"
+        }
+      ]
+    },
+    "anthropic": {
+      "name": "Anthropic Claude",
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "models": [
+        {
+          "id": "claude-3-7-sonnet-latest",
+          "displayName": "Claude 3.7 Sonnet"
+        },
+        {
+          "id": "claude-3-5-haiku-latest",
+          "displayName": "Claude 3.5 Haiku"
+        }
+      ]
+    },
+    "openai": {
+      "name": "OpenAI",
+      "apiKey": "${OPENAI_API_KEY}",
+      "models": [
+        {
+          "id": "gpt-4o",
+          "displayName": "GPT-4o"
+        },
+        {
+          "id": "gpt-4o-mini",
+          "displayName": "GPT-4o Mini"
+        },
+        {
+          "id": "o3-mini",
+          "displayName": "o3-mini"
+        }
+      ]
+    }
+  },
+  "skills": [
+    "/etc/pi/skills/*"
+  ],
+  "extensions": [
+    "/etc/pi/skills/*/index.ts"
+  ]
+}
+EOF
+fi
+
+chmod 0644 /etc/skel/.config/pi/config.json
+
+# Also create settings.json and models.json for Pi native discovery
+if [ ! -f /etc/skel/.config/pi/settings.json ]; then
+    cat << 'EOF' > /etc/skel/.config/pi/settings.json
+{
+  "defaultProvider": "ollama",
+  "defaultModel": "qwen2.5-coder:7b",
+  "defaultThinkingLevel": "low",
+  "skills": [
+    "/etc/pi/skills/*"
+  ],
+  "extensions": [
+    "/etc/pi/skills/*/index.ts"
+  ]
+}
+EOF
+    chmod 0644 /etc/skel/.config/pi/settings.json
+fi
+
+if [ ! -f /etc/skel/.config/pi/models.json ]; then
+    cat << 'EOF' > /etc/skel/.config/pi/models.json
+{
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [
+        { "id": "qwen2.5-coder:7b" },
+        { "id": "deepseek-r1:8b" },
+        { "id": "llama3.1:8b" }
+      ]
+    },
+    "deepseek": {
+      "baseUrl": "https://api.deepseek.com/v1",
+      "api": "openai-completions",
+      "apiKey": "${DEEPSEEK_API_KEY}",
+      "models": [
+        { "id": "deepseek-chat" },
+        { "id": "deepseek-reasoner" }
+      ]
+    }
+  }
+}
+EOF
+    chmod 0644 /etc/skel/.config/pi/models.json
+fi
+
+# 4. Symlink /etc/skel/.config/pi/skills -> /etc/pi/skills
+rm -rf /etc/skel/.config/pi/skills
+ln -sf /etc/pi/skills /etc/skel/.config/pi/skills
+
+# Symlink legacy ~/.pi/agent to ~/.config/pi for complete compatibility
+mkdir -p /etc/skel/.pi
+rm -rf /etc/skel/.pi/agent
+ln -sf ../.config/pi /etc/skel/.pi/agent
+
+echo "==> [Hook] 0070-install-pi-agent completed successfully."

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://pi.dev/schema/config.json",
+  "description": "AgenticOS Pi Agent direct user model & system configuration",
+  "defaultProvider": "ollama",
+  "defaultModel": "qwen2.5-coder:7b",
+  "defaultThinkingLevel": "low",
+  "providers": {
+    "ollama": {
+      "name": "Ollama (Local / Offline)",
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [
+        {
+          "id": "qwen2.5-coder:7b",
+          "displayName": "Qwen 2.5 Coder 7B (Default Local)"
+        },
+        {
+          "id": "deepseek-r1:8b",
+          "displayName": "DeepSeek R1 8B (Reasoning)"
+        },
+        {
+          "id": "llama3.1:8b",
+          "displayName": "Llama 3.1 8B"
+        }
+      ]
+    },
+    "deepseek": {
+      "name": "DeepSeek API",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "api": "openai-completions",
+      "apiKey": "${DEEPSEEK_API_KEY}",
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "displayName": "DeepSeek V3"
+        },
+        {
+          "id": "deepseek-reasoner",
+          "displayName": "DeepSeek R1"
+        }
+      ]
+    },
+    "anthropic": {
+      "name": "Anthropic Claude",
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "models": [
+        {
+          "id": "claude-3-7-sonnet-latest",
+          "displayName": "Claude 3.7 Sonnet"
+        },
+        {
+          "id": "claude-3-5-haiku-latest",
+          "displayName": "Claude 3.5 Haiku"
+        }
+      ]
+    },
+    "openai": {
+      "name": "OpenAI",
+      "apiKey": "${OPENAI_API_KEY}",
+      "models": [
+        {
+          "id": "gpt-4o",
+          "displayName": "GPT-4o"
+        },
+        {
+          "id": "gpt-4o-mini",
+          "displayName": "GPT-4o Mini"
+        },
+        {
+          "id": "o3-mini",
+          "displayName": "o3-mini"
+        }
+      ]
+    }
+  },
+  "skills": [
+    "/etc/pi/skills/*"
+  ],
+  "extensions": [
+    "/etc/pi/skills/*/index.ts"
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "@agentic/skill-agent-memory",
+  "version": "1.0.0",
+  "description": "AgenticOS SQLite-backed Cross-session Memory Skill for Pi Agent",
+  "type": "module",
+  "main": "index.ts"
+}

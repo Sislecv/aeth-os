@@ -1,0 +1,7 @@
+{
+  "name": "@agentic/skill-browser-use",
+  "version": "1.0.0",
+  "description": "AgenticOS Browser Automation & Snapshot Skill for Pi Agent",
+  "type": "module",
+  "main": "index.ts"
+}

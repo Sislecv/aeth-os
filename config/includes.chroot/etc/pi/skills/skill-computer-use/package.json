@@ -1,0 +1,7 @@
+{
+  "name": "@agentic/skill-computer-use",
+  "version": "1.0.0",
+  "description": "AgenticOS Computer Use Skill for Pi Agent",
+  "type": "module",
+  "main": "index.ts"
+}

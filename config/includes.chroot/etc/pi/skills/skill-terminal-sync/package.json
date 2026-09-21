@@ -1,0 +1,7 @@
+{
+  "name": "@agentic/skill-terminal-sync",
+  "version": "1.0.0",
+  "description": "AgenticOS Zellij Companion Bi-directional Synchronization Skill for Pi Agent",
+  "type": "module",
+  "main": "index.ts"
+}
