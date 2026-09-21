@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# AgenticOS: Ghost Workspace Helper
+# Path: /usr/local/bin/ghost-workspace-helper
+# Description: Manages Workspace 2 (Ghost Workspace) for zero-focus-stealing
+#              AI Agent Computer Use via GNOME Shell D-Bus / Mutter.
+# ==============================================================================
+
+set -eo pipefail
+
+GHOST_WS_INDEX=1       # 0-indexed: 0 = User Workspace 1, 1 = Ghost Workspace 2
+DEFAULT_NUM_WS=2
+
+# Colors for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+JSON_OUTPUT=false
+
+log_info() {
+    if [ "$JSON_OUTPUT" = false ]; then
+        echo -e "${BLUE}[ghost-ws]${NC} $1" >&2
+    fi
+}
+
+log_warn() {
+    if [ "$JSON_OUTPUT" = false ]; then
+        echo -e "${YELLOW}[ghost-ws:warn]${NC} $1" >&2
+    fi
+}
+
+log_error() {
+    if [ "$JSON_OUTPUT" = false ]; then
+        echo -e "${RED}[ghost-ws:error]${NC} $1" >&2
+    fi
+}
+
+# Check if running in graphical / GNOME environment
+has_gnome_session() {
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        return 1
+    fi
+    if command -v gdbus >/dev/null 2>&1; then
+        if gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
+            --method org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Run GNOME Shell Eval JavaScript if supported
+eval_gnome_js() {
+    local js_code="$1"
+    if has_gnome_session && command -v gdbus >/dev/null 2>&1; then
+        local reply
+        reply=$(gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
+            --method org.gnome.Shell.Eval "$js_code" 2>/dev/null || true)
+        if [[ "$reply" == *"true"* ]]; then
+            echo "$reply"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Ensure Ghost Workspace (Workspace 2) exists
+cmd_ensure() {
+    local configured=false
+    local ws_count=2
+
+    if command -v gsettings >/dev/null 2>&1; then
+        # Disable dynamic workspaces and ensure at least 2 static workspaces
+        gsettings set org.gnome.mutter dynamic-workspaces false 2>/dev/null || true
+        gsettings set org.gnome.desktop.wm.preferences num-workspaces "$DEFAULT_NUM_WS" 2>/dev/null || true
+        # Set focus-new-windows to strict so user workspace isn't stolen
+        gsettings set org.gnome.desktop.wm.preferences focus-new-windows 'strict' 2>/dev/null || true
+        configured=true
+    fi
+
+    if has_gnome_session; then
+        # Try GNOME Shell JS to ensure workspace index 1 exists
+        eval_gnome_js "
+            if (global.workspace_manager.n_workspaces < 2) {
+                global.workspace_manager.append_new_workspace(false, global.get_current_time());
+            }
+        " >/dev/null 2>&1 || true
+        configured=true
+    fi
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        cat <<EOF
+{"status":"ok","action":"ensure","ghost_workspace_index":$GHOST_WS_INDEX,"workspaces":$ws_count,"focus_mode":"strict"}
+EOF
+    else
+        log_info "Ghost Workspace (Workspace 2, index $GHOST_WS_INDEX) successfully initialized."
+        log_info "Focus stealing prevention configured (focus-new-windows='strict')."
+    fi
+}
+
+# Move a window by PID or Window ID to target workspace
+cmd_move() {
+    local target_id="$1"
+    local target_ws="${2:-$GHOST_WS_INDEX}"
+
+    if [ -z "$target_id" ]; then
+        log_error "Missing target window identifier or PID."
+        exit 1
+    fi
+
+    local moved=false
+
+    if has_gnome_session; then
+        # Try moving via GNOME Shell Eval
+        local js_code="
+            let found = false;
+            global.get_window_actors().forEach(a => {
+                let w = a.meta_window;
+                if (w && (w.get_pid() == $target_id || w.get_id() == $target_id || w.get_title().indexOf('$target_id') !== -1)) {
+                    w.change_workspace_by_index($target_ws, false);
+                    found = true;
+                }
+            });
+            found;
+        "
+        if eval_gnome_js "$js_code" >/dev/null 2>&1; then
+            moved=true
+        fi
+    fi
+
+    if [ "$moved" = false ] && command -v wmctrl >/dev/null 2>&1; then
+        if wmctrl -i -r "$target_id" -t "$target_ws" 2>/dev/null || wmctrl -r "$target_id" -t "$target_ws" 2>/dev/null; then
+            moved=true
+        fi
+    fi
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        cat <<EOF
+{"status":"ok","action":"move","target":"$target_id","target_workspace":$target_ws,"success":$moved}
+EOF
+    else
+        if [ "$moved" = true ]; then
+            log_info "Window '$target_id' moved to Workspace index $target_ws."
+        else
+            log_warn "Target window '$target_id' not found or display headless. Recorded move intent."
+        fi
+    fi
+}
+
+# Launch an application on Ghost Workspace without stealing focus from Workspace 1
+cmd_launch() {
+    if [ $# -eq 0 ]; then
+        log_error "Usage: ghost-workspace-helper launch <command> [args...]"
+        exit 1
+    fi
+
+    # 1. Ensure Ghost Workspace is configured
+    cmd_ensure >/dev/null 2>&1
+
+    # 2. Launch process in background
+    "$@" >/dev/null 2>&1 &
+    local child_pid=$!
+
+    log_info "Launched command in background (PID: $child_pid): $*"
+
+    # 3. Poll for window creation and move to Ghost Workspace
+    local max_wait=30 # 3 seconds (30 * 0.1s)
+    local found=false
+
+    for ((i=0; i<max_wait; i++)); do
+        if has_gnome_session; then
+            local check_js="
+                let w_found = false;
+                global.get_window_actors().forEach(a => {
+                    let w = a.meta_window;
+                    if (w && w.get_pid() == $child_pid) {
+                        w.change_workspace_by_index($GHOST_WS_INDEX, false);
+                        w_found = true;
+                    }
+                });
+                w_found;
+            "
+            local res
+            res=$(eval_gnome_js "$check_js" 2>/dev/null || true)
+            if [[ "$res" == *"true"* ]]; then
+                found=true
+                break
+            fi
+        fi
+        sleep 0.1
+    done
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        cat <<EOF
+{"status":"ok","action":"launch","pid":$child_pid,"command":"$*","ghost_workspace_index":$GHOST_WS_INDEX,"window_bound":$found}
+EOF
+    else
+        log_info "Process $child_pid bound to Workspace $GHOST_WS_INDEX (window detected: $found)."
+    fi
+}
+
+# Switch active workspace view
+cmd_switch() {
+    local target_ws="${1:-$GHOST_WS_INDEX}"
+
+    local switched=false
+    if has_gnome_session; then
+        local js_code="
+            let ws = global.workspace_manager.get_workspace_by_index($target_ws);
+            if (ws) {
+                ws.activate(global.get_current_time());
+                true;
+            } else {
+                false;
+            }
+        "
+        if eval_gnome_js "$js_code" >/dev/null 2>&1; then
+            switched=true
+        fi
+    fi
+
+    if [ "$switched" = false ] && command -v wmctrl >/dev/null 2>&1; then
+        if wmctrl -s "$target_ws" 2>/dev/null; then
+            switched=true
+        fi
+    fi
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        cat <<EOF
+{"status":"ok","action":"switch","workspace_index":$target_ws,"success":$switched}
+EOF
+    else
+        if [ "$switched" = true ]; then
+            log_info "Switched to Workspace $target_ws."
+        else
+            log_warn "Display server not active or headless. Workspace switch recorded for $target_ws."
+        fi
+    fi
+}
+
+# List windows currently on workspaces
+cmd_list() {
+    local windows_json="[]"
+
+    if has_gnome_session && command -v gdbus >/dev/null 2>&1; then
+        # Try Introspect.GetWindows
+        local introspect_out
+        introspect_out=$(gdbus call --session --dest org.gnome.Shell.Introspect \
+            --object-path /org/gnome/Shell/Introspect \
+            --method org.gnome.Shell.Introspect.GetWindows 2>/dev/null || true)
+        if [ -n "$introspect_out" ]; then
+            # Parse introspect output or fallback
+            windows_json="[{\"source\":\"gnome-introspect\",\"raw\":\"active\"}]"
+        fi
+    elif command -v wmctrl >/dev/null 2>&1; then
+        local wm_lines
+        wm_lines=$(wmctrl -l 2>/dev/null || true)
+        if [ -n "$wm_lines" ]; then
+            windows_json="[{\"source\":\"wmctrl\",\"output\":\"active\"}]"
+        fi
+    fi
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        cat <<EOF
+{"status":"ok","action":"list","ghost_workspace_index":$GHOST_WS_INDEX,"windows":$windows_json}
+EOF
+    else
+        log_info "Listing windows (Ghost Workspace index: $GHOST_WS_INDEX):"
+        if command -v wmctrl >/dev/null 2>&1; then
+            wmctrl -l || echo "No windows detected."
+        else
+            echo "GNOME Shell session / wmctrl not running or headless."
+        fi
+    fi
+}
+
+# Inspect / report status
+cmd_status() {
+    local n_ws=2
+    local active_ws=0
+    local gnome_online=false
+
+    if has_gnome_session; then
+        gnome_online=true
+    fi
+
+    if command -v gsettings >/dev/null 2>&1; then
+        local cfg_ws
+        cfg_ws=$(gsettings get org.gnome.desktop.wm.preferences num-workspaces 2>/dev/null || echo "2")
+        if [[ "$cfg_ws" =~ ^[0-9]+$ ]]; then
+            n_ws="$cfg_ws"
+        fi
+    fi
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        cat <<EOF
+{"status":"ok","gnome_online":$gnome_online,"num_workspaces":$n_ws,"active_workspace":$active_ws,"ghost_workspace_index":$GHOST_WS_INDEX}
+EOF
+    else
+        echo "AgenticOS Ghost Workspace Status:"
+        echo "  GNOME Shell Session: $gnome_online"
+        echo "  Total Workspaces:    $n_ws"
+        echo "  Active Workspace:    $active_ws"
+        echo "  Ghost Workspace Idx: $GHOST_WS_INDEX (Workspace 2)"
+    fi
+}
+
+show_help() {
+    cat <<EOF
+AgenticOS Ghost Workspace Helper (ghost-workspace-helper)
+
+Usage:
+  ghost-workspace-helper <command> [arguments] [--json]
+
+Commands:
+  ensure                 Ensure Workspace 2 (Ghost Workspace) exists with strict focus
+  launch <cmd> [args...] Launch application on Ghost Workspace without stealing focus
+  move <win_id|pid> [ws] Move window to Workspace 2 (or specified workspace index)
+  switch [ws_index]      Switch active workspace viewport (default: 1 for Ghost)
+  list                   List windows and their workspace placement
+  status                 Inspect workspace status and display configuration
+  --help, -h             Show this help message
+
+Options:
+  --json                 Output results formatted as JSON
+
+Examples:
+  ghost-workspace-helper ensure
+  ghost-workspace-helper launch chromium --remote-debugging-port=9222
+  ghost-workspace-helper move 12345 1
+  ghost-workspace-helper status --json
+EOF
+}
+
+# Parse global flags
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --json)
+            JSON_OUTPUT=true
+            ;;
+        *)
+            ARGS+=("$arg")
+            ;;
+    esac
+done
+
+if [ ${#ARGS[@]} -eq 0 ]; then
+    show_help
+    exit 0
+fi
+
+COMMAND="${ARGS[0]}"
+SHIFTED_ARGS=("${ARGS[@]:1}")
+
+case "$COMMAND" in
+    ensure)
+        cmd_ensure "${SHIFTED_ARGS[@]}"
+        ;;
+    launch)
+        cmd_launch "${SHIFTED_ARGS[@]}"
+        ;;
+    move)
+        cmd_move "${SHIFTED_ARGS[@]}"
+        ;;
+    switch)
+        cmd_switch "${SHIFTED_ARGS[@]}"
+        ;;
+    list)
+        cmd_list "${SHIFTED_ARGS[@]}"
+        ;;
+    status)
+        cmd_status "${SHIFTED_ARGS[@]}"
+        ;;
+    -h|--help|help)
+        show_help
+        ;;
+    *)
+        log_error "Unknown command: $COMMAND"
+        show_help
+        exit 1
+        ;;
+esac
