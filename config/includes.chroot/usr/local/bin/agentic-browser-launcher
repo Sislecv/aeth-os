@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# AgenticOS: Browser Launcher (agentic-browser-launcher)
+# Path: /usr/local/bin/agentic-browser-launcher
+# Description: Manages dedicated Chromium instances with persistent session/cookie
+#              storage, CDP remote debugging (port 9222), headless/headed modes,
+#              and Ghost Workspace reveal/hide integrations.
+# ==============================================================================
+
+set -eo pipefail
+
+DEFAULT_PORT=9222
+DEFAULT_PROFILE="${XDG_CONFIG_HOME:-$HOME/.config}/agentic/browser"
+ACTION="launch"
+MODE="headless"
+PORT="$DEFAULT_PORT"
+PROFILE_DIR="$DEFAULT_PROFILE"
+JSON_OUTPUT=false
+DRY_RUN=false
+URL=""
+
+# Colors for terminal output
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+log_info() {
+    if [ "$JSON_OUTPUT" = false ]; then
+        echo -e "${BLUE}[browser-launcher]${NC} $1" >&2
+    fi
+}
+
+log_warn() {
+    if [ "$JSON_OUTPUT" = false ]; then
+        echo -e "${YELLOW}[browser-launcher:warn]${NC} $1" >&2
+    fi
+}
+
+log_error() {
+    if [ "$JSON_OUTPUT" = false ]; then
+        echo -e "${RED}[browser-launcher:error]${NC} $1" >&2
+    fi
+}
+
+show_help() {
+    cat <<EOF
+AgenticOS Browser Launcher (agentic-browser-launcher)
+Manages dedicated Chromium instances with persistent sessions and CDP automation.
+
+Usage:
+  agentic-browser-launcher [OPTIONS] [URL]
+
+Actions / Modes:
+  --headless            Launch background headless Chromium (default)
+  --headed              Launch headed Chromium in Ghost Workspace (Workspace 2)
+  --reveal              Bring running Chromium window to Workspace 1 (CAPTCHA/login)
+  --hide                Return running Chromium window to Ghost Workspace 2
+  --status              Check CDP port and status (outputs JSON, exit 0 if running)
+  --stop                Terminate running CDP Chromium instance
+
+Options:
+  --port, -p <port>     CDP remote debugging port (default: 9222)
+  --profile <path>      Custom user data directory (default: ~/.config/agentic/browser)
+  --json                Output results formatted as JSON
+  --dry-run             Print the Chromium launch command without executing
+  --help, -h            Show this help message
+
+Examples:
+  agentic-browser-launcher --headless
+  agentic-browser-launcher --headed https://github.com/login
+  agentic-browser-launcher --status
+  agentic-browser-launcher --reveal
+  agentic-browser-launcher --stop
+EOF
+}
+
+# Locate Chromium executable
+get_chromium_bin() {
+    if [ -n "${AGENTIC_BROWSER_BIN:-}" ] && [ -x "${AGENTIC_BROWSER_BIN}" ]; then
+        echo "${AGENTIC_BROWSER_BIN}"
+        return 0
+    fi
+    if [ -n "${CHROMIUM_BIN:-}" ] && [ -x "${CHROMIUM_BIN}" ]; then
+        echo "${CHROMIUM_BIN}"
+        return 0
+    fi
+    for b in chromium chromium-browser google-chrome /usr/bin/chromium /usr/bin/chromium-browser; do
+        if command -v "$b" >/dev/null 2>&1; then
+            command -v "$b"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Ensure profile directory exists with proper permissions
+ensure_profile_dir() {
+    local pdir="$1"
+    if [ ! -d "$pdir" ]; then
+        mkdir -p "$pdir"
+        chmod 700 "$pdir" 2>/dev/null || true
+    fi
+}
+
+get_pid_file() {
+    local port="$1"
+    echo "${XDG_RUNTIME_DIR:-/tmp}/agentic-browser-${port}.pid"
+}
+
+# Check if CDP port is actively listening and responsive
+is_cdp_ready() {
+    local port="$1"
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --connect-timeout 1 --max-time 2 "http://127.0.0.1:${port}/json/version" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
+        exec 3>&-
+        return 0
+    fi
+    return 1
+}
+
+# Find PID of running Chromium instance for given port / profile
+get_running_pid() {
+    local port="$1"
+    local pdir="$2"
+    local pid_file
+    pid_file="$(get_pid_file "$port")"
+
+    # Check pid file
+    if [ -f "$pid_file" ]; then
+        local p
+        p=$(cat "$pid_file" 2>/dev/null || true)
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+            echo "$p"
+            return 0
+        fi
+    fi
+
+    # Check profile directory pid file
+    if [ -f "${pdir}/chromium.pid" ]; then
+        local p
+        p=$(cat "${pdir}/chromium.pid" 2>/dev/null || true)
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+            echo "$p"
+            return 0
+        fi
+    fi
+
+    # Match by process cmdline
+    local match_pid
+    match_pid=$(pgrep -f "remote-debugging-port=${port}" 2>/dev/null | head -n 1 || true)
+    if [ -n "$match_pid" ] && kill -0 "$match_pid" 2>/dev/null; then
+        echo "$match_pid"
+        return 0
+    fi
+
+    return 1
+}
+
+# Navigate running instance to URL via CDP endpoint or agent-browser
+navigate_url() {
+    local url="$1"
+    local port="$2"
+    if [ -z "$url" ] || [ "$url" = "about:blank" ]; then
+        return 0
+    fi
+
+    if command -v agent-browser >/dev/null 2>&1; then
+        agent-browser open "$url" >/dev/null 2>&1 || true
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL -X PUT "http://127.0.0.1:${port}/json/new?${url}" >/dev/null 2>&1 || true
+    fi
+}
+
+cmd_status() {
+    local port="$PORT"
+    local pdir="$PROFILE_DIR"
+    local pid
+    pid=$(get_running_pid "$port" "$pdir" || echo "")
+
+    local cdp_active=false
+    if is_cdp_ready "$port"; then
+        cdp_active=true
+    fi
+
+    local is_running=false
+    if [ "$cdp_active" = true ] || [ -n "$pid" ]; then
+        is_running=true
+    fi
+
+    cat <<EOF
+{
+  "status": "$([ "$is_running" = true ] && echo "running" || echo "stopped")",
+  "running": $is_running,
+  "cdp_ready": $cdp_active,
+  "port": $port,
+  "pid": $([ -n "$pid" ] && echo "$pid" || echo "null"),
+  "profile_dir": "$pdir"
+}
+EOF
+
+    if [ "$is_running" = true ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+cmd_stop() {
+    local port="$PORT"
+    local pdir="$PROFILE_DIR"
+    local pid
+    pid=$(get_running_pid "$port" "$pdir" || echo "")
+    local pid_file
+    pid_file="$(get_pid_file "$port")"
+
+    if [ -z "$pid" ]; then
+        rm -f "$pid_file" "${pdir}/chromium.pid" 2>/dev/null || true
+        if [ "$JSON_OUTPUT" = true ]; then
+            cat <<EOF
+{"status":"ok","action":"stop","message":"No running Chromium instance found on port $port","running":false}
+EOF
+        else
+            log_info "No running Chromium instance found on port $port."
+        fi
+        return 0
+    fi
+
+    log_info "Terminating Chromium instance (PID: $pid)..."
+    kill -TERM "$pid" 2>/dev/null || true
+
+    local stopped=false
+    for ((i=0; i<30; i++)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            stopped=true
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [ "$stopped" = false ]; then
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 0.2
+    fi
+
+    rm -f "$pid_file" "${pdir}/chromium.pid" 2>/dev/null || true
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        cat <<EOF
+{"status":"ok","action":"stop","message":"Chromium stopped","pid":$pid,"port":$port}
+EOF
+    else
+        log_info "Successfully stopped Chromium (PID: $pid) on port $port."
+    fi
+    return 0
+}
+
+cmd_reveal() {
+    local port="$PORT"
+    local pdir="$PROFILE_DIR"
+    local pid
+    pid=$(get_running_pid "$port" "$pdir" || echo "")
+
+    if [ -z "$pid" ]; then
+        if [ "$JSON_OUTPUT" = true ]; then
+            cat <<EOF
+{"status":"error","action":"reveal","message":"No running Chromium instance found on port $port"}
+EOF
+        else
+            log_error "No running Chromium instance found on port $port to reveal."
+        fi
+        return 1
+    fi
+
+    local helper=""
+    if command -v ghost-workspace-helper >/dev/null 2>&1; then
+        helper="$(command -v ghost-workspace-helper)"
+    elif [ -x "/usr/local/bin/ghost-workspace-helper" ]; then
+        helper="/usr/local/bin/ghost-workspace-helper"
+    fi
+
+    local helper_invoked=false
+    if [ -n "$helper" ]; then
+        # Move browser window to Workspace 1 (index 0) and activate Workspace 1
+        "$helper" move "$pid" 0 >/dev/null 2>&1 || true
+        "$helper" switch 0 >/dev/null 2>&1 || true
+        helper_invoked=true
+    else
+        log_warn "ghost-workspace-helper not found; window move skipped."
+    fi
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        cat <<EOF
+{"status":"ok","action":"reveal","pid":$pid,"target_workspace":0,"helper_invoked":$helper_invoked}
+EOF
+    else
+        log_info "Chromium (PID: $pid) revealed to Workspace 1 for user intervention / CAPTCHA solving."
+    fi
+    return 0
+}
+
+cmd_hide() {
+    local port="$PORT"
+    local pdir="$PROFILE_DIR"
+    local pid
+    pid=$(get_running_pid "$port" "$pdir" || echo "")
+
+    if [ -z "$pid" ]; then
+        return 1
+    fi
+
+    local helper=""
+    if command -v ghost-workspace-helper >/dev/null 2>&1; then
+        helper="$(command -v ghost-workspace-helper)"
+    elif [ -x "/usr/local/bin/ghost-workspace-helper" ]; then
+        helper="/usr/local/bin/ghost-workspace-helper"
+    fi
+
+    local helper_invoked=false
+    if [ -n "$helper" ]; then
+        # Move browser window back to Ghost Workspace 2 (index 1)
+        "$helper" move "$pid" 1 >/dev/null 2>&1 || true
+        helper_invoked=true
+    fi
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        cat <<EOF
+{"status":"ok","action":"hide","pid":$pid,"target_workspace":1,"helper_invoked":$helper_invoked}
+EOF
+    else
+        log_info "Chromium (PID: $pid) returned to Ghost Workspace 2."
+    fi
+    return 0
+}
+
+cmd_launch() {
+    ensure_profile_dir "$PROFILE_DIR"
+    local pid_file
+    pid_file="$(get_pid_file "$PORT")"
+
+    # Check if instance is already running
+    local existing_pid
+    existing_pid=$(get_running_pid "$PORT" "$PROFILE_DIR" || true)
+    if [ -n "$existing_pid" ]; then
+        if [ "$JSON_OUTPUT" = true ]; then
+            cat <<EOF
+{"status":"already_running","action":"launch","port":$PORT,"pid":$existing_pid,"profile_dir":"$PROFILE_DIR"}
+EOF
+        else
+            log_info "Chromium is already running on port $PORT (PID: $existing_pid)."
+        fi
+        if [ -n "$URL" ] && [ "$URL" != "about:blank" ]; then
+            navigate_url "$URL" "$PORT"
+        fi
+        return 0
+    fi
+
+    # Assemble Chromium launch arguments
+    local args=(
+        "--remote-debugging-port=${PORT}"
+        "--remote-debugging-address=127.0.0.1"
+        "--user-data-dir=${PROFILE_DIR}"
+        "--no-first-run"
+        "--no-default-browser-check"
+        "--password-store=basic"
+        "--disable-sync"
+        "--disable-features=Translate,OptimizationHints,MediaRouter"
+        "--disable-component-update"
+        "--disable-background-networking"
+    )
+
+    if [ "$MODE" = "headless" ]; then
+        args+=(
+            "--headless=new"
+            "--disable-gpu"
+            "--window-size=1280,800"
+            "--mute-audio"
+            "--disable-dev-shm-usage"
+        )
+    else
+        args+=(
+            "--window-size=1280,800"
+            "--class=AgenticBrowser"
+        )
+    fi
+
+    local target_url="${URL:-about:blank}"
+
+    # Handle --dry-run
+    if [ "$DRY_RUN" = true ]; then
+        local bin_preview
+        bin_preview=$(get_chromium_bin 2>/dev/null || echo "chromium")
+        if [ "$JSON_OUTPUT" = true ]; then
+            local args_json
+            args_json=$(printf '%s\n' "${args[@]}" "$target_url" | jq -R . | jq -s . 2>/dev/null || echo "[]")
+            cat <<EOF
+{"status":"dry_run","binary":"$bin_preview","mode":"$MODE","port":$PORT,"profile_dir":"$PROFILE_DIR","url":"$target_url","command":"$bin_preview ${args[*]} $target_url"}
+EOF
+        else
+            echo "$bin_preview ${args[*]} $target_url"
+        fi
+        return 0
+    fi
+
+    local chromium_bin
+    chromium_bin=$(get_chromium_bin) || {
+        log_error "Chromium executable not found in PATH."
+        if [ "$JSON_OUTPUT" = true ]; then
+            cat <<EOF
+{"status":"error","action":"launch","message":"Chromium binary not found"}
+EOF
+        fi
+        return 1
+    }
+
+    local child_pid=""
+    local helper=""
+    if [ "$MODE" = "headed" ] && command -v ghost-workspace-helper >/dev/null 2>&1; then
+        helper="$(command -v ghost-workspace-helper)"
+    elif [ "$MODE" = "headed" ] && [ -x "/usr/local/bin/ghost-workspace-helper" ]; then
+        helper="/usr/local/bin/ghost-workspace-helper"
+    fi
+
+    if [ -n "$helper" ]; then
+        log_info "Launching headed Chromium inside Ghost Workspace via ghost-workspace-helper..."
+        # ghost-workspace-helper launch starts the command in background and moves window to Workspace 2
+        local launch_json
+        launch_json=$("$helper" launch "$chromium_bin" "${args[@]}" "$target_url" --json 2>/dev/null || true)
+        child_pid=$(echo "$launch_json" | grep -o '"pid":[0-9]*' | cut -d':' -f2 || true)
+        if [ -z "$child_pid" ]; then
+            child_pid=$(get_running_pid "$PORT" "$PROFILE_DIR" || true)
+        fi
+    else
+        log_info "Launching Chromium ($MODE mode) on CDP port $PORT..."
+        "$chromium_bin" "${args[@]}" "$target_url" >/dev/null 2>&1 &
+        child_pid=$!
+    fi
+
+    if [ -n "$child_pid" ]; then
+        echo "$child_pid" > "$pid_file"
+        echo "$child_pid" > "${PROFILE_DIR}/chromium.pid" 2>/dev/null || true
+    fi
+
+    # Wait for CDP readiness (up to 3 seconds)
+    local ready=false
+    for ((i=0; i<30; i++)); do
+        if is_cdp_ready "$PORT"; then
+            ready=true
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        cat <<EOF
+{
+  "status": "ok",
+  "action": "launch",
+  "mode": "$MODE",
+  "pid": $([ -n "$child_pid" ] && echo "$child_pid" || echo "null"),
+  "port": $PORT,
+  "cdp_ready": $ready,
+  "profile_dir": "$PROFILE_DIR",
+  "url": "$target_url"
+}
+EOF
+    else
+        log_info "Chromium ($MODE) active on CDP port $PORT (PID: ${child_pid:-unknown}, CDP ready: $ready)."
+        log_info "Session profile: $PROFILE_DIR"
+    fi
+    return 0
+}
+
+# Parse command-line arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --headless)
+            MODE="headless"
+            ACTION="launch"
+            shift
+            ;;
+        --headed)
+            MODE="headed"
+            ACTION="launch"
+            shift
+            ;;
+        --reveal)
+            ACTION="reveal"
+            shift
+            ;;
+        --hide|--conceal)
+            ACTION="hide"
+            shift
+            ;;
+        --status)
+            ACTION="status"
+            shift
+            ;;
+        --stop)
+            ACTION="stop"
+            shift
+            ;;
+        --port|-p)
+            if [ -z "${2:-}" ]; then
+                log_error "Option $1 requires a port argument."
+                exit 1
+            fi
+            PORT="$2"
+            shift 2
+            ;;
+        --profile)
+            if [ -z "${2:-}" ]; then
+                log_error "Option $1 requires a path argument."
+                exit 1
+            fi
+            PROFILE_DIR="$2"
+            shift 2
+            ;;
+        --json)
+            JSON_OUTPUT=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --help|-h|help)
+            show_help
+            exit 0
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            show_help >&2
+            exit 1
+            ;;
+        *)
+            if [ -z "$URL" ]; then
+                URL="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+case "$ACTION" in
+    status)
+        cmd_status
+        ;;
+    stop)
+        cmd_stop
+        ;;
+    reveal)
+        cmd_reveal
+        ;;
+    hide)
+        cmd_hide
+        ;;
+    launch)
+        cmd_launch
+        ;;
+    *)
+        log_error "Unknown action: $ACTION"
+        exit 1
+        ;;
+esac

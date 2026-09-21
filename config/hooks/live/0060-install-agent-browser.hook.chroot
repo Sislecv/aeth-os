@@ -1,0 +1,106 @@
+#!/bin/bash
+# ==============================================================================
+# AgenticOS: 0060-install-agent-browser.hook.chroot
+#
+# Installs agent-browser globally via npm and configures browser dependencies.
+# Provides offline fallback to ensure non-blocking live-build chroot execution.
+# ==============================================================================
+set -euo pipefail
+
+echo "===================================================================="
+echo "==> [Hook] Installing agent-browser and browser automation runtime..."
+echo "===================================================================="
+
+# Check if npm is available
+if ! command -v npm >/dev/null 2>&1; then
+    echo "==> Warning: npm is not available in chroot PATH."
+    echo "==> Verifying if nodejs / npm is installed in standard locations..."
+    if [ -x "/usr/bin/npm" ]; then
+        export PATH="/usr/bin:/usr/local/bin:${PATH}"
+    fi
+fi
+
+# Function to check online connectivity to npm registry
+check_internet() {
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --connect-timeout 5 --max-time 15 "https://registry.npmjs.org/" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        if wget -q --spider --timeout=5 --tries=1 "https://registry.npmjs.org/" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    if command -v npm >/dev/null 2>&1; then
+        if npm ping --timeout=5000 >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Function to setup offline bootstrap wrapper if npm install is skipped or fails
+setup_offline_fallback() {
+    local target_bin="/usr/local/bin/agent-browser"
+    if [ -x "${target_bin}" ]; then
+        echo "==> Existing agent-browser binary found at ${target_bin}, keeping existing installation."
+        return 0
+    fi
+
+    echo "==> Creating offline bootstrap fallback at ${target_bin}..."
+    mkdir -p "/usr/local/bin"
+    cat << 'EOF' > "${target_bin}"
+#!/usr/bin/env bash
+# AgenticOS: agent-browser offline bootstrap fallback
+set -eo pipefail
+
+if command -v npm >/dev/null 2>&1; then
+    echo "[agent-browser-bootstrap] Checking network connectivity..." >&2
+    if curl -fsSL --connect-timeout 3 "https://registry.npmjs.org/" >/dev/null 2>&1; then
+        echo "[agent-browser-bootstrap] Network available. Completing installation..." >&2
+        npm install -g agent-browser >&2 && agent-browser install --with-deps >&2 || true
+        if [ -x "/usr/local/share/npm/bin/agent-browser" ] || [ -x "/usr/bin/agent-browser" ]; then
+            exec agent-browser "$@"
+        fi
+    fi
+fi
+
+echo "[agent-browser] Error: agent-browser package is not yet fully installed." >&2
+echo "[agent-browser] Please connect to the internet and run:" >&2
+echo "    npm install -g agent-browser && agent-browser install --with-deps" >&2
+exit 1
+EOF
+    chmod 755 "${target_bin}"
+    echo "==> Offline bootstrap wrapper installed."
+}
+
+# Attempt installation if npm is present
+if command -v npm >/dev/null 2>&1; then
+    if check_internet; then
+        echo "==> Internet connection detected. Running 'npm install -g agent-browser'..."
+        if npm install -g agent-browser; then
+            echo "==> agent-browser successfully installed via npm."
+            
+            # Configure browser binaries & dependencies if internet is available
+            if command -v agent-browser >/dev/null 2>&1; then
+                echo "==> Running 'agent-browser install --with-deps'..."
+                agent-browser install --with-deps || {
+                    echo "==> Notice: 'agent-browser install --with-deps' returned non-zero code; using system Chromium as runtime."
+                }
+            fi
+        else
+            echo "==> Warning: npm install -g agent-browser failed. Initializing offline fallback."
+            setup_offline_fallback
+        fi
+    else
+        echo "==> Warning: Network connection unavailable during chroot hook execution."
+        echo "==> Setting up offline fallback to prevent live-build interruption..."
+        setup_offline_fallback
+    fi
+else
+    echo "==> Warning: npm command not found. Setting up offline fallback..."
+    setup_offline_fallback
+fi
+
+echo "==> [Hook] 0060-install-agent-browser completed successfully."
