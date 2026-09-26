@@ -338,15 +338,15 @@ class TestFlashUsbScript(unittest.TestCase):
 
     def test_dry_run_partition_naming_nvme(self):
         res = subprocess.run(
-            [str(FLASH_USB_SCRIPT), "--dry-run", "/dev/nvme0n1"],
+            [str(FLASH_USB_SCRIPT), "--dry-run", "/dev/nvme99n1"],
             capture_output=True,
             text=True,
         )
         self.assertEqual(res.returncode, 0)
         out = res.stdout
-        self.assertIn("/dev/nvme0n1p1", out)
-        self.assertIn("/dev/nvme0n1p2", out)
-        self.assertIn("/dev/nvme0n1p3", out)
+        self.assertIn("/dev/nvme99n1p1", out)
+        self.assertIn("/dev/nvme99n1p2", out)
+        self.assertIn("/dev/nvme99n1p3", out)
 
     def test_real_run_requires_root_or_fails(self):
         # Non-root user running real execution without sudo must fail

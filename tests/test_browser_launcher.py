@@ -243,6 +243,11 @@ exit 0
             test_port = "29225"
             pid_file = Path(f"/tmp/agentic-browser-{test_port}.pid")
             pid_file.write_text(str(dummy_pid))
+            xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+            xdg_pid_file = None
+            if xdg_runtime and os.path.isdir(xdg_runtime):
+                xdg_pid_file = Path(xdg_runtime) / f"agentic-browser-{test_port}.pid"
+                xdg_pid_file.write_text(str(dummy_pid))
 
             custom_env = os.environ.copy()
             custom_env["PATH"] = f"{tmpdir}:{custom_env.get('PATH', '')}"
@@ -286,6 +291,8 @@ exit 0
                 dummy_proc.wait()
                 if pid_file.exists():
                     pid_file.unlink()
+                if xdg_pid_file and xdg_pid_file.exists():
+                    xdg_pid_file.unlink()
 
 
 class TestAgentBrowserCommandChain(unittest.TestCase):

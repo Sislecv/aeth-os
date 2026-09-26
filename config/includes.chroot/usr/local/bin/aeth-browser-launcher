@@ -140,6 +140,14 @@ get_running_pid() {
             return 0
         fi
     fi
+    if [ -f "/tmp/agentic-browser-${port}.pid" ]; then
+        local p
+        p=$(cat "/tmp/agentic-browser-${port}.pid" 2>/dev/null || true)
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+            echo "$p"
+            return 0
+        fi
+    fi
 
     # Check profile directory pid file
     if [ -f "${pdir}/chromium.pid" ]; then
