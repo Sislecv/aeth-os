@@ -1,0 +1,130 @@
+name: Build and Release Aeth OS ISO
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag name (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Test Suite
+        run: |
+          python3 -m unittest discover -s tests -p "test*.py"
+
+      - name: Static Shell Syntax Check
+        run: |
+          bash -n auto/* scripts/*.sh config/hooks/live/*.hook.chroot config/includes.chroot/usr/local/bin/* config/includes.chroot/etc/agentic/*.sh
+
+  build-and-release:
+    name: Build Live ISO and Publish Release
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space on Runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Install live-build and Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y live-build debootstrap xorriso isolinux syslinux-utils coreutils
+
+      - name: Configure and Build Live ISO
+        run: |
+          sudo make config
+          sudo make build
+
+      - name: Prepare Release Artifacts
+        id: prepare_artifacts
+        run: |
+          # Locate ISO image
+          ISO_FILE=$(ls *.hybrid.iso 2>/dev/null || ls *.iso 2>/dev/null | head -n 1)
+          if [ -z "$ISO_FILE" ] || [ ! -f "$ISO_FILE" ]; then
+            echo "Error: No ISO image found after build."
+            exit 1
+          fi
+          
+          # Standardize name
+          if [ "$ISO_FILE" != "aeth-os-live-amd64.hybrid.iso" ]; then
+            mv "$ISO_FILE" aeth-os-live-amd64.hybrid.iso
+          fi
+          
+          sha256sum aeth-os-live-amd64.hybrid.iso > SHA256SUMS.txt
+          echo "ISO_FILE=aeth-os-live-amd64.hybrid.iso" >> $GITHUB_ENV
+          ls -lh aeth-os-live-amd64.hybrid.iso SHA256SUMS.txt
+
+      - name: Determine Release Tag
+        id: get_tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG_NAME=${{ github.event.inputs.release_tag }}" >> $GITHUB_ENV
+          else
+            echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          fi
+
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: Aeth OS ${{ env.TAG_NAME }} - Official Live Release
+          draft: false
+          prerelease: false
+          files: |
+            aeth-os-live-amd64.hybrid.iso
+            SHA256SUMS.txt
+          body: |
+            # 🪐 Aeth OS ${{ env.TAG_NAME }}
+
+            Welcome to the official release of **Aeth OS** — the portable AI-native Debian live USB operating system.
+
+            ### 🚀 Quick Start
+            1. **Verify Integrity**:
+               ```bash
+               sha256sum -c SHA256SUMS.txt
+               ```
+            2. **Flash to Physical USB Drive**:
+               ```bash
+               # Clone tools or use flash-usb.sh directly:
+               sudo ./scripts/flash-usb.sh /dev/sdX
+               ```
+            3. **Run on Local QEMU (Virtual Machine)**:
+               ```bash
+               ./scripts/test-qemu.sh --iso aeth-os-live-amd64.hybrid.iso
+               ```
+
+            ### 🌟 Key Capabilities
+            - **Ghost Workspace (Workspace 2)**: Agent operates GUI in isolation without focus-stealing.
+            - **Zellij 65:35 Companion Terminal**: Main Shell + Pi Agent (`@earendil-works/pi-coding-agent`) with Shell Hooks (`Alt+A/B/C`).
+            - **Browser Use Stack**: CDP session persistence with compact `@eN` accessibility tree snapshots.
+            - **Local Offline Speech-to-Text**: `F5` voice dictation with VAD 1.0s auto-stop; `Super+F5` direct prompt to Pi Agent.
+            - **Direct-Stream On-Demand Paging**: Cold boot consumes only ~700MB RAM, preserving >85% physical RAM for local LLMs (Ollama) and dev tools.
+            - **System Tools**: `aeth-doctor` (hardware health/diagnostics), `aeth-net` (WiFi & network manager), `aeth-zen-toggle` (Zen focus mode).
+
+            ---
+            *Built with Debian live-build and love for AI pair programming.*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

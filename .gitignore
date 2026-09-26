@@ -3,3 +3,15 @@ __pycache__/
 *$py.class
 *.sock
 .pytest_cache/
+
+# Live-Build and ISO image artifacts
+*.iso
+*.hybrid.iso
+*.img
+.build/
+chroot/
+binary/
+binary.modified.timestamp
+build.log
+cache/
+*.toast
