@@ -21,6 +21,7 @@ import socket
 import stat
 import subprocess
 import tempfile
+import shutil
 import threading
 import time
 import unittest
@@ -77,6 +78,8 @@ class TestDconfConfiguration(unittest.TestCase):
 
     def test_dconf_compile_syntax(self):
         """Test compiling dconf database with 03-blurt-voice included."""
+        if not shutil.which("dconf"):
+            self.skipTest("dconf CLI not available on current host, skipping compilation test")
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_db = os.path.join(tmp_dir, "test_db")
             dconf_dir = DCONF_PATH.parent
